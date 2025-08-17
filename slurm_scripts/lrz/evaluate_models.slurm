@@ -67,16 +67,14 @@ mkdir -p "$RESULTS_DIR"
 
 python -m lm_eval \
     --model hf \
-    --model_args pretrained="$MODEL" \
+    --model_args pretrained="$MODEL,return_token_details=True,trust_remote_code=True,enable_thinking=False" \
     --tasks "$TASKS" \
     --num_fewshot "$FEWSHOT" \
     --batch_size auto \
     --output_path "$OUT_FILE" \
     --log_samples \
-    --apply_chat_template \
-    --fewshot_as_multiturn \
     --device cuda:0
 
 echo "Evaluation of $MODEL completed successfully!"
 
-# lm_eval --model hf --model_args "pretrained=Qwen/Qwen3-1.7B,return_token_details=True,trust_remote_code=True,enable_thinking=False" --tasks leaderboard_bbh --device cuda:0 --batch_size 8 --output_path "results_scratch/test" --apply_chat_template --limit 0.05 --log_samples
+# lm_eval --model hf --model_args "pretrained=Qwen/Qwen3-14B,return_token_details=True,trust_remote_code=True,enable_thinking=False" --tasks leaderboard_mmlu_pro --device cuda:0 --batch_size 8 --output_path "results_scratch/test" --apply_chat_template --limit 0.05 --log_samples --num_fewshot 5 --fewshot_as_multiturn
