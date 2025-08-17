@@ -78,4 +78,4 @@ python -m lm_eval \
 
 echo "Evaluation of $MODEL completed successfully!"
 
-# lm_eval --model hf --model_args "pretrained=Qwen/Qwen3-1.7B,return_token_details=True,trust_remote_code=True" --tasks truthfulqa_gen --device cuda:0 --batch_size 8 --output_path "results_scratch/test" --apply_chat_template
+# lm_eval --model hf --model_args "pretrained=Qwen/Qwen3-1.7B,return_token_details=True,trust_remote_code=True" --tasks truthfulqa_gen --device cuda:0 --batch_size 8 --output_path "results_scratch/test" --apply_chat_template --limit 0.05

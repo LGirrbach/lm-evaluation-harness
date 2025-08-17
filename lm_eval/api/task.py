@@ -1544,13 +1544,19 @@ class ConfigurableTask(Task):
 
     def process_results(self, doc, results):
         if callable(self.config.process_results):
-            return self.config.process_results(doc, results)
+            try:
+                return self.config.process_results(doc, [result["text"] for result in results])
+            except:
+                return self.config.process_results(doc, results)
 
         result_dict = {}
         use_metric = list(self._metric_fn_list.keys())
         if self.OUTPUT_TYPE == "loglikelihood":
             results = results[0]
-            ll, is_greedy = results
+            if isinstance(results, dict):
+                ll, is_greedy = results["total_loglikelihood"], results["is_greedy"]
+            else:
+                ll, is_greedy = results
             return {
                 **({"perplexity": ll} if "perplexity" in use_metric else {}),
                 **({"acc": int(is_greedy)} if "acc" in use_metric else {}),
@@ -1790,7 +1796,7 @@ class MultipleChoiceTask(Task):
 
     def process_results(self, doc: dict, results: Iterable[Tuple[float, bool]]) -> dict:
         results = [
-            res[0] for res in results
+            res["total_loglikelihood"] if isinstance(res, dict) else res[0] for res in results
         ]  # only retain loglikelihoods, discard is_greedy TODO: do we need is_greedy anywhere?
         gold = doc["gold"]
 
