@@ -766,7 +766,7 @@ class HFLM(TemplateLM):
         if tokenizer:
             if isinstance(tokenizer, str):
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    tokenizer, token=os.environ.get("HFTOKEN")
+                    tokenizer, token=os.environ.get("HFTOKEN"), **kwargs
                 )
             else:
                 assert isinstance(
@@ -785,7 +785,7 @@ class HFLM(TemplateLM):
                 # get the HF hub name via accessor on model
                 model_name = self.model.name_or_path
             self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                model_name, **kwargs
+                model_name, token=os.environ.get("HFTOKEN"), **kwargs
             )
 
     def _detect_batch_size(self, requests: Sequence | None = None, pos: int = 0):
