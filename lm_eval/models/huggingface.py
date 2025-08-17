@@ -103,6 +103,8 @@ class HFLM(TemplateLM):
         think_end_token: str | int | None = None,
         enable_thinking: bool | None = None,
         chat_template_args: dict[str, Any] | None = None,
+        # Option to return detailed token-level information
+        return_token_details: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -271,6 +273,7 @@ class HFLM(TemplateLM):
             if mixed_precision_dtype is not None
             else None
         )
+        self.return_token_details = return_token_details
 
         if str(batch_size).startswith("auto"):
             batch_size = batch_size.split(":")
@@ -961,7 +964,7 @@ class HFLM(TemplateLM):
         max_length: int,
         stop: list[str],
         **generation_kwargs: dict[str, Any],
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         # temperature = 0.0 if not set
         # if do_sample is false and temp==0.0:
         # remove temperature, as do_sample=False takes care of this
@@ -975,6 +978,12 @@ class HFLM(TemplateLM):
 
         if do_sample is False and generation_kwargs.get("temperature") == 0.0:
             generation_kwargs.pop("temperature")
+        
+        # Add output_scores if we want token details
+        if self.return_token_details:
+            generation_kwargs["output_scores"] = True
+            generation_kwargs["return_dict_in_generate"] = True
+        
         # build stopping criteria
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
@@ -984,7 +993,7 @@ class HFLM(TemplateLM):
             dtype=self.mixed_precision_dtype,
             enabled=self.mixed_precision_dtype is not None,
         ):
-            return self.model.generate(
+            output = self.model.generate(
                 input_ids=context,
                 max_length=max_length,
                 stopping_criteria=stopping_criteria,
@@ -992,6 +1001,13 @@ class HFLM(TemplateLM):
                 use_cache=True,
                 **generation_kwargs,
             )
+            
+            if self.return_token_details:
+                # Return both sequences and scores
+                return output.sequences, output.scores
+            else:
+                # Return just sequences for backward compatibility
+                return output
 
     def _select_cont_toks(
         self,
@@ -1091,7 +1107,12 @@ class HFLM(TemplateLM):
             # Get all nlls for this request
             request_nlls = all_nlls[current_idx : current_idx + window_count]
             # Sum up the nlls for this request (discarding is_greedy)
-            request_total = sum(nll[0] for _, nll in request_nlls)
+            if self.return_token_details:
+                # When returning token details, each item is a dict with total_loglikelihood
+                request_total = sum(nll["total_loglikelihood"] for _, nll in request_nlls)
+            else:
+                # Backward compatibility - each item is a tuple (log_prob, is_greedy)
+                request_total = sum(nll[0] for _, nll in request_nlls)
             loglikelihoods.append(request_total)
             current_idx += window_count
 
@@ -1124,7 +1145,7 @@ class HFLM(TemplateLM):
         requests: list[tuple[tuple[str, str], list[int], list[int]]],
         disable_tqdm: bool = False,
         override_bs: int | None = None,
-    ) -> list[tuple[float, bool]]:
+    ) -> list[tuple[float, bool] | dict[str, Any]]:
         # TODO: implement some kind of efficient-request-middleware that lumps together requests with the same context
         res = []
 
@@ -1336,8 +1357,23 @@ class HFLM(TemplateLM):
                         -1
                     )  # [1, seq]
 
-                    # Answer: (log prob, is-exact-match)
-                    answer = (float(logits.sum()), bool(max_equal))
+                    if self.return_token_details:
+                        # Return detailed token information
+                        cont_tokens_list = cont_toks.squeeze(0).tolist()
+                        logprobs_list = logits.squeeze(0).tolist()
+                        tokens_text = self.tokenizer.convert_ids_to_tokens(cont_tokens_list)
+                        
+                        answer = {
+                            "total_loglikelihood": float(logits.sum()),
+                            "is_greedy": bool(max_equal),
+                            "tokens": tokens_text,
+                            "logprobs": logprobs_list,
+                            "context": request_str[0] if request_str else None,
+                            "continuation": request_str[1] if request_str else None,
+                        }
+                    else:
+                        # Return original format for backward compatibility
+                        answer = (float(logits.sum()), bool(max_equal))
 
                     res.append(answer)
 
@@ -1356,7 +1392,7 @@ class HFLM(TemplateLM):
 
     def generate_until(
         self, requests: list[Instance], disable_tqdm: bool = False
-    ) -> list[str]:
+    ) -> list[str] | list[dict[str, Any]]:
         res = []
 
         def _collate(req: tuple[str, dict]):
@@ -1458,8 +1494,16 @@ class HFLM(TemplateLM):
                 **kwargs,
             )
 
-            cont_toks_list = cont.tolist()
-            for cont_toks, context in zip(cont_toks_list, contexts):
+            if self.return_token_details:
+                # Unpack sequences and scores
+                cont, scores = cont
+                cont_toks_list = cont.tolist()
+            else:
+                # Backward compatibility - cont is just the sequences tensor
+                cont_toks_list = cont.tolist()
+                scores = None
+
+            for i, (cont_toks, context) in enumerate(zip(cont_toks_list, contexts)):
                 # discard context + left-padding toks if using causal decoder-only LM
                 if self.backend == "causal":
                     cont_toks = cont_toks[context_enc.shape[1] :]
@@ -1488,7 +1532,36 @@ class HFLM(TemplateLM):
                     if isinstance(self.think_end_token, str)
                     else None,
                 )
-                res.append(s)
+
+                if self.return_token_details and scores is not None:
+                    # Compute per-token logprobs from scores
+                    step_logprobs = []
+                    step_token_ids = []
+                    tokens_text = []
+                    
+                    # scores is a list of tensors [batch, vocab] for each generation step
+                    for t, step_logits in enumerate(scores):
+                        if t < len(cont_toks):  # Make sure we don't go out of bounds
+                            # step_logits: [batch, vocab]
+                            lp = F.log_softmax(step_logits[i], dim=-1)  # [vocab]
+                            tok_id = cont_toks[t]
+                            step_logprobs.append(lp[tok_id].item())
+                            step_token_ids.append(tok_id)
+                            tokens_text.append(self.tokenizer.convert_ids_to_tokens([tok_id])[0])
+                    
+                    # Create detailed result
+                    result = {
+                        "text": s,
+                        "tokens": tokens_text,
+                        "logprobs": step_logprobs,
+                        "context": context,
+                        "task": "",
+                        "model": self.pretrained,
+                    }
+                    res.append(result)
+                else:
+                    # Return just the text for backward compatibility
+                    res.append(s)
 
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
                 pbar.update(1)
