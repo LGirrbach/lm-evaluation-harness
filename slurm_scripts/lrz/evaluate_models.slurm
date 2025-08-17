@@ -47,7 +47,7 @@ MODELS=(
 )
 
 # Popular multiple-choice tasks
-TASKS="arc_easy,arc_challenge,hellaswag,winogrande,boolq,piqa,openbookqa,commonsense_qa,headqa,prost"
+TASKS="arc_easy,arc_challenge,hellaswag,winogrande,boolq,piqa,openbookqa,commonsense_qa,headqa,prost,truthfulqa_mc1,mmlu,medmcqa,mathqa,leaderboard_gpqa,leaderboard_bbh,leaderboard_mmlu_pro"
 
 # Number of few-shot examples
 FEWSHOT=5

@@ -1305,9 +1305,12 @@ class HFLM(TemplateLM):
                     "attn_mask": batched_encoder_mask,
                     "labels": batched_conts,
                 }
-
+            
+            
+            raw_logits = self._model_call(batched_inps, **call_kwargs)
+            
             multi_logits = F.log_softmax(
-                self._model_call(batched_inps, **call_kwargs),
+                raw_logits, 
                 dim=-1,
                 dtype=self.softmax_dtype,
             )  # [batch, padding_length (inp or cont), vocab]
@@ -1329,6 +1332,15 @@ class HFLM(TemplateLM):
                 logits = self._select_cont_toks(logits, contlen=contlen, inplen=ctx_len)
                 logits = logits.unsqueeze(0)  # [1, seq, vocab]
 
+                # Get corresponding raw logits if available
+                raw_logits_slice = None
+                if raw_logits is not None:
+                    raw_logits_slice = self._select_cont_toks(
+                        raw_logits[chunk.index((request_str, ctx_tokens, _))], 
+                        contlen=contlen, 
+                        inplen=ctx_len
+                    ).unsqueeze(0)  # [1, seq, vocab]
+
                 # Check if per-token argmax is exactly equal to continuation
                 greedy_tokens = logits.argmax(dim=-1)
 
@@ -1346,7 +1358,7 @@ class HFLM(TemplateLM):
                     cont_toks = torch.tensor(
                         cont_toks, dtype=torch.long, device=self.device
                     ).unsqueeze(0)  # [1, seq]
-                    # Use trailing slice [-cont_toks.shape[1]:] to handle variable length cont_len (but same ctx+cont[:-1]).
+                    # Use trailing slice [-cont_toks.shape[1]:] to handle variable length cont_len (same ctx+cont[:-1]).
                     # i.e. continuations can be sliced at diff points. Collator ensures we have sufficient greedy_tokens
                     # by choosing key with longest cont if group_by="contexts".
                     max_equal = (
@@ -1365,11 +1377,41 @@ class HFLM(TemplateLM):
                         logprobs_list = logits.squeeze(0).tolist()
                         tokens_text = self.tokenizer.convert_ids_to_tokens(cont_tokens_list)
                         
+                        # Get raw scores and compute entropy if raw logits are available
+                        raw_scores_list = []
+                        entropies_list = []
+                        vocab_sizes_list = []
+                        
+                        if raw_logits_slice is not None:
+                            # Get raw scores for the continuation tokens
+                            raw_scores = torch.gather(raw_logits_slice, 2, cont_toks.unsqueeze(-1)).squeeze(-1)  # [1, seq]
+                            raw_scores_list = raw_scores.squeeze(0).tolist()
+                            
+                            # Compute entropy for each token position
+                            for t in range(raw_logits_slice.shape[1]):
+                                # Get raw logits for this token position
+                                token_logits = raw_logits_slice[0, t, :]  # [vocab]
+                                # Compute probabilities
+                                probs = F.softmax(token_logits, dim=-1)  # [vocab]
+                                # Compute unnormalized entropy: -sum(p * log(p)) * vocab_size
+                                vocab_size = probs.shape[0]
+                                entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+                                entropies_list.append(entropy.item())
+                                vocab_sizes_list.append(vocab_size)
+                        else:
+                            # If no raw logits available, fill with None or default values
+                            raw_scores_list = [None] * len(cont_tokens_list)
+                            entropies_list = [None] * len(cont_tokens_list)
+                            vocab_sizes_list = [None] * len(cont_tokens_list)
+                        
                         answer = {
                             "total_loglikelihood": float(logits.sum()),
                             "is_greedy": bool(max_equal),
                             "tokens": tokens_text,
                             "logprobs": logprobs_list,
+                            "raw_scores": raw_scores_list,
+                            "entropies": entropies_list,
+                            "vocab_sizes": vocab_sizes_list,
                             "context": request_str[0] if request_str else None,
                             "continuation": request_str[1] if request_str else None,
                         }
@@ -1540,6 +1582,9 @@ class HFLM(TemplateLM):
                     step_logprobs = []
                     step_token_ids = []
                     tokens_text = []
+                    step_raw_scores = []
+                    step_entropies = []
+                    step_vocab_sizes = []
                     
                     # scores is a list of tensors [batch, vocab] for each generation step
                     for t, step_logits in enumerate(scores):
@@ -1550,12 +1595,27 @@ class HFLM(TemplateLM):
                             step_logprobs.append(lp[tok_id].item())
                             step_token_ids.append(tok_id)
                             tokens_text.append(self.tokenizer.convert_ids_to_tokens([tok_id])[0])
+                            
+                            # Store raw scores (before log-softmax)
+                            step_raw_scores.append(step_logits[i].tolist())
+                            
+                            # Compute entropy over vocabulary
+                            probs = F.softmax(step_logits[i], dim=-1)  # [vocab]
+                            # Compute unnormalized entropy: -sum(p * log(p)) * vocab_size
+                            # This allows reconstruction of normalized entropy later
+                            vocab_size = probs.shape[0]
+                            entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+                            step_entropies.append(entropy.item())
+                            step_vocab_sizes.append(vocab_size)
                     
                     # Create detailed result
                     result = {
                         "text": s,
                         "tokens": tokens_text,
                         "logprobs": step_logprobs,
+                        "raw_scores": step_raw_scores,
+                        "entropies": step_entropies,
+                        "vocab_sizes": step_vocab_sizes,
                         "context": context,
                         "task": "",
                         "model": self.pretrained,
