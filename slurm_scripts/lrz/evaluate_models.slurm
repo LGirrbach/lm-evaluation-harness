@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=8                    # Request 8 cpus per task
 #SBATCH --mem=70GB                           # Request 70GB of cpu memory per node
 #SBATCH --time=12:00:00                      # Time limit hrs:min:sec (adjust as needed)
-#SBATCH --output=slurm_logs/evaluation/output/evaluate_models_%A_%a.out  # Output file (%A=array job ID, %a=array task ID)
-#SBATCH --error=slurm_logs/evaluation/error/evaluate_models_%A_%a.err    # Error log file
+#SBATCH --output=slurm_logs/evaluation/output/evaluate_models_%a.out  # Output file (%A=array job ID, %a=array task ID)
+#SBATCH --error=slurm_logs/evaluation/error/evaluate_models_%a.err    # Error log file
 #SBATCH --partition=mcml-hgx-h100-94x4,mcml-hgx-a100-80x4
 #SBATCH --qos=mcml
 #SBATCH --array=0-15
@@ -73,8 +73,8 @@ python -m lm_eval \
     --batch_size auto \
     --output_path "$OUT_FILE" \
     --log_samples \
-    --log_samples_path "$LOG_FILE" \
-    --use_cache  # Avoid re-downloading datasets
+    --apply_chat_template \
+    --device cuda:0
 
 echo "Evaluation of $MODEL completed successfully!"
 
