@@ -766,7 +766,7 @@ class HFLM(TemplateLM):
         if tokenizer:
             if isinstance(tokenizer, str):
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    tokenizer, **kwargs
+                    tokenizer, token=os.environ.get("HFTOKEN")
                 )
             else:
                 assert isinstance(
