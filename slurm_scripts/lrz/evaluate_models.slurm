@@ -69,7 +69,6 @@ python -m lm_eval \
     --model hf \
     --model_args pretrained="$MODEL,return_token_details=True,trust_remote_code=True,enable_thinking=False" \
     --tasks "$TASKS" \
-    --num_fewshot "$FEWSHOT" \
     --batch_size auto \
     --output_path "$OUT_FILE" \
     --log_samples \
