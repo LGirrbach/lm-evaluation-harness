@@ -564,6 +564,7 @@ class HFLM(TemplateLM):
             trust_remote_code=trust_remote_code,
             gguf_file=gguf_file,
             subfolder=subfolder,
+            token=os.environ.get("HFTOKEN"),
         )
 
     def _create_model(

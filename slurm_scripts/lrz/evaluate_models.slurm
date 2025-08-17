@@ -20,8 +20,12 @@ RESULTS_DIR="./results_scratch"
 # List of HF model names (3B–20B range)
 MODELS=(
   # Qwen3 Models
-
-  Qwen/Qwen3-0.6B
+  "Qwen/Qwen3-0.6B"
+  "Qwen/Qwen3-1.7B"
+  "Qwen/Qwen3-4B"
+  "Qwen/Qwen3-8B"
+  "Qwen/Qwen3-14B"
+  # Llama3 Models
   "openai/gpt-oss-20b"
   "meta-llama/Llama-3.1-8B-Instruct"
   "google/gemma-3-1b-it"
