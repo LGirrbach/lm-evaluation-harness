@@ -10,7 +10,7 @@
 #SBATCH --error=slurm_logs/evaluation/error/evaluate_models_%A_%a.err    # Error log file
 #SBATCH --partition=lrz-hgx-h100-94x4,lrz-hgx-a100-80x4
 #SBATCH --exclude=lrz-hgx-h100-027
-#SBATCH --array=0-19                         # Array indices for 20 models
+#SBATCH --array=0-15
 
 set -euo pipefail
 
@@ -25,20 +25,22 @@ MODELS=(
   "Qwen/Qwen3-4B"
   "Qwen/Qwen3-8B"
   "Qwen/Qwen3-14B"
-  # Llama3 Models
-  "openai/gpt-oss-20b"
+  # Llama Models
+  "meta-llama/Llama-3.2-1B-Instruct"
+  "meta-llama/Llama-3.2-3B-Instruct"
   "meta-llama/Llama-3.1-8B-Instruct"
-  "google/gemma-3-1b-it"
-  "Qwen/Qwen3-4B"
-  "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
-  "meta-llama/Llama-3.1-8B"
-  "microsoft/Phi-3-mini-4k-instruct"
-  "Qwen/Qwen3-8B"
-  "mistralai/Mistral-7B-Instruct-v0.2"
-  "Qwen/Qwen3-14B"
+  # Phi Models
   "microsoft/phi-4"
-  "microsoft/Phi-4-mini-flash-reasoning"
-  "google/gemma-7b-it"
+  # Google Gemma Models
+  "google/gemma-3-270m-it"
+  "google/gemma-3-1b-it"
+  "google/gemma-3-4b-it"
+  "google/gemma-3-12b-it"
+  # Mistral Models
+  "ministral/Ministral-3b-instruct"
+  "mistralai/Ministral-8B-Instruct-2410"
+  # Other Models
+  "openai/gpt-oss-20b"
 )
 
 # Popular multiple-choice tasks
@@ -73,4 +75,4 @@ python -m lm_eval \
 
 echo "Evaluation of $MODEL completed successfully!"
 
-# lm_eval --model hf --model_args "pretrained=meta-llama/Llama-3.1-8B-Instruct,return_token_details=True" --tasks winogrande --device cuda:0 --batch_size 8 --output_path "results_scratch/test" --apply_chat_template
+# lm_eval --model hf --model_args "pretrained=Qwen/Qwen3-14B,return_token_details=True,trust_remote_code=True" --tasks winogrande --device cuda:0 --batch_size 8 --output_path "results_scratch/test" --apply_chat_template
