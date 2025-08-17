@@ -12,6 +12,9 @@
 #SBATCH --qos=mcml
 #SBATCH --array=0-15
 
+source /dss/dsshome1/04/go25kod3/miniforge3/etc/profile.d/conda.sh
+conda activate lm-eval-harness
+
 set -euo pipefail
 
 # Directory to store results
