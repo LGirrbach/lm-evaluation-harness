@@ -1373,7 +1373,7 @@ class HFLM(TemplateLM):
                         }
                     else:
                         # Return original format for backward compatibility
-                        answer = (float(logits.sum()), bool(max_equal))
+                        answer = (float(logits.sum()), bool(max_equal), logits.cpu().tolist())
 
                     res.append(answer)
 
