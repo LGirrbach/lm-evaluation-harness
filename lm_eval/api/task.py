@@ -994,10 +994,12 @@ class ConfigurableTask(Task):
                 **(self.config.metadata or {}), **(self.config.dataset_kwargs or {})
             )
         else:
+            import os
             self.dataset = datasets.load_dataset(
                 path=self.DATASET_PATH,
                 name=self.DATASET_NAME,
                 **dataset_kwargs if dataset_kwargs is not None else {},
+                token=os.environ.get("HFTOKEN"),
             )
 
     def has_training_docs(self) -> bool:

@@ -47,7 +47,7 @@ MODELS=(
 )
 
 # Popular multiple-choice tasks
-TASKS="arc_easy,arc_challenge,hellaswag,winogrande,boolq,piqa,openbookqa,commonsense_qa,headqa,prost,truthfulqa_mc1,mmlu,medmcqa,mathqa,leaderboard_gpqa,leaderboard_bbh,leaderboard_mmlu_pro"
+TASKS="arc_easy,arc_challenge,hellaswag,winogrande,boolq,piqa,openbookqa,commonsense_qa,headqa,prost,truthfulqa_mc1,mmlu,medmcqa,leaderboard_gpqa,leaderboard_bbh,leaderboard_mmlu_pro"
 
 # Number of few-shot examples
 FEWSHOT=5
@@ -74,8 +74,9 @@ python -m lm_eval \
     --output_path "$OUT_FILE" \
     --log_samples \
     --apply_chat_template \
+    --fewshot_as_multiturn \
     --device cuda:0
 
 echo "Evaluation of $MODEL completed successfully!"
 
-# lm_eval --model hf --model_args "pretrained=meta-llama/Llama-3.2-1B-Instruct,return_token_details=True,trust_remote_code=True,enable_thinking=False" --tasks truthfulqa_gen --device cuda:0 --batch_size 8 --output_path "results_scratch/test" --apply_chat_template --limit 0.05 --log_samples
+# lm_eval --model hf --model_args "pretrained=Qwen/Qwen3-1.7B,return_token_details=True,trust_remote_code=True,enable_thinking=False" --tasks leaderboard_bbh --device cuda:0 --batch_size 8 --output_path "results_scratch/test" --apply_chat_template --limit 0.05 --log_samples
