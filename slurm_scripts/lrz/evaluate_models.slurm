@@ -8,8 +8,8 @@
 #SBATCH --time=12:00:00                      # Time limit hrs:min:sec (adjust as needed)
 #SBATCH --output=slurm_logs/evaluation/output/evaluate_models_%A_%a.out  # Output file (%A=array job ID, %a=array task ID)
 #SBATCH --error=slurm_logs/evaluation/error/evaluate_models_%A_%a.err    # Error log file
-#SBATCH --partition=lrz-hgx-h100-94x4,lrz-hgx-a100-80x4
-#SBATCH --exclude=lrz-hgx-h100-027
+#SBATCH --partition=mcml-hgx-h100-94x4,mcml-hgx-a100-80x4
+#SBATCH --qos=mcml
 #SBATCH --array=0-15
 
 set -euo pipefail
