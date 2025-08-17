@@ -1577,7 +1577,11 @@ class ConfigurableTask(Task):
                 ),
             }
         elif self.OUTPUT_TYPE == "multiple_choice":
-            lls, is_greedy, *_ = zip(*results)
+            try:
+                lls = [result["total_loglikelihood"] for result in results]
+                is_greedy = [result["is_greedy"] for result in results]
+            except:
+                lls, is_greedy, *_ = zip(*results)
 
             # retrieve choices in List[str] form, to compute choice lengths, etc.
             choices = self.doc_to_choice(doc)
