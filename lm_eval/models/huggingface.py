@@ -1407,13 +1407,13 @@ class HFLM(TemplateLM):
                         answer = {
                             "total_loglikelihood": float(logits.sum()),
                             "is_greedy": bool(max_equal),
-                            "tokens": tokens_text,
+                            #"tokens": tokens_text,
                             "logprobs": logprobs_list,
-                            "raw_scores": raw_scores_list,
+                            #"raw_scores": raw_scores_list,
                             "entropies": entropies_list,
-                            "vocab_sizes": vocab_sizes_list,
-                            "context": request_str[0] if request_str else None,
-                            "continuation": request_str[1] if request_str else None,
+                            #"vocab_sizes": vocab_sizes_list,
+                            #"context": request_str[0] if request_str else None,
+                            #"continuation": request_str[1] if request_str else None,
                         }
                     else:
                         # Return original format for backward compatibility
@@ -1611,14 +1611,14 @@ class HFLM(TemplateLM):
                     # Create detailed result
                     result = {
                         "text": s,
-                        "tokens": tokens_text,
+                        #"tokens": tokens_text,
                         "logprobs": step_logprobs,
-                        "raw_scores": step_raw_scores,
+                        #"raw_scores": step_raw_scores,
                         "entropies": step_entropies,
-                        "vocab_sizes": step_vocab_sizes,
-                        "context": context,
-                        "task": "",
-                        "model": self.pretrained,
+                        #"vocab_sizes": step_vocab_sizes,
+                        #"context": context,
+                        #"task": "",
+                        #"model": self.pretrained,
                     }
                     res.append(result)
                 else:
