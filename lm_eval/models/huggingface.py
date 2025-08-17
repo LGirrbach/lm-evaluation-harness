@@ -630,6 +630,7 @@ class HFLM(TemplateLM):
                 gguf_file=gguf_file,
                 quantization_config=quantization_config,
                 subfolder=subfolder,
+                token=os.environ.get("HFTOKEN"),
                 **model_kwargs,
             )
         else:
