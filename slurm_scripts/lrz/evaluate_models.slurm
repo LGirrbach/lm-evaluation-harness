@@ -71,7 +71,7 @@ python -m lm_eval \
     --tasks "$TASKS" \
     --batch_size auto \
     --output_path "$OUT_FILE" \
-    --log_samples \
+    --log_samples_path "$LOG_FILE" \
     --device cuda:0
 
 echo "Evaluation of $MODEL completed successfully!"
