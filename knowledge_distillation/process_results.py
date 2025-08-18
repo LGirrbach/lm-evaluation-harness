@@ -1,109 +1,120 @@
 import os
-import re
 import json
 import pandas as pd
 
 from tqdm import tqdm
 from ast import literal_eval
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
-def _extract_task_name(filename: str) -> str:
+LETTER_TO_IDX = {chr(ord('A') + i): i for i in range(26)}
+
+
+def extract_task_name(filename: str) -> str:
+    base = os.path.splitext(filename)[0]
+    rest = base[len("samples_"):] if base.startswith("samples_") else base
+    if "_" in rest:
+        rest = rest.rsplit("_", 1)[0]
+    return rest
+
+
+def normalize_text(s: str) -> str:
+    return " ".join(s.strip().split()).casefold()
+
+
+def _entropy_weighted_avg_logprobs(logprobs: List[float], entropies: List[float]):
+    """Compute sum(H_i * lp_i) / sum(H_i). If sum(H_i)==0, fall back to mean logprobs.
+    Returns pandas.NA if inputs are empty.
     """
-    Extract task name from files like 'samples_<task>_<timestamp>.jsonl'.
-    Keeps full task prefix (e.g., 'mmlu_world_religions').
-    """
-    base = filename[:-6] if filename.endswith(".jsonl") else filename
-    if base.startswith("samples_"):
-        base = base[len("samples_"):]
-    # Drop the trailing timestamp chunk after the last underscore
-    return base.rsplit("_", 1)[0] if "_" in base else base
+    if not logprobs:
+        return pd.NA
+    if not entropies or len(entropies) != len(logprobs):
+        return sum(logprobs) / len(logprobs)
+    denom = sum(entropies)
+    if denom == 0:
+        return sum(logprobs) / len(logprobs)
+    num = sum(h * lp for h, lp in zip(entropies, logprobs))
+    return num / denom
 
 
-def _to_resp_dict(x: Any) -> Dict[str, Any]:
-    """
-    Convert a mixed response entry (str, dict, list[str]) into a dict.
-    Handles:
-      - dict
-      - "{"total_loglikelihood": ...}" (as str)
-      - ["{"total_loglikelihood": ...}"] (from resps)
-    """
-    if isinstance(x, dict):
-        return x
-    if isinstance(x, list) and x:
-        x = x[0]
-    if isinstance(x, str):
-        return literal_eval(x)
-    raise ValueError(f"Unsupported response entry type: {type(x)}")
+def get_candidate_resps(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return candidate response dicts from filtered_resps or resps."""
+    if record.get("filtered_resps"):
+        entries = record["filtered_resps"]
+    elif record.get("resps"):
+        raw = record["resps"]
+        entries = [r[0] if isinstance(r, list) and r else r for r in raw]
+    else:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for e in entries:
+        if isinstance(e, dict):
+            out.append(e)
+        elif isinstance(e, str):
+            out.append(literal_eval(e))
+    return out
 
 
-def _safe_mean(arr: List[float]) -> float | None:
-    try:
-        return (sum(arr) / len(arr)) if arr else None
-    except Exception:
+def resolve_correct_index(record: Dict[str, Any], num_candidates: int) -> Optional[int]:
+    """Resolve the ground-truth index from several possible fields and formats."""
+    choices = record.get("doc", {}).get("choices")
+
+    def try_coerce(val: Any) -> Optional[int]:
+        if isinstance(val, int):
+            return val if 0 <= val < num_candidates else None
+        if isinstance(val, float) and float(val).is_integer():
+            ival = int(val)
+            return ival if 0 <= ival < num_candidates else None
+        if isinstance(val, str):
+            s = val.strip()
+            if s.isdigit():
+                ival = int(s)
+                return ival if 0 <= ival < num_candidates else None
+            lower = s.lower()
+            if lower.startswith("answer:"):
+                s = s.split(":", 1)[1].strip()
+            s = s.strip().rstrip(".")
+            if len(s) >= 2 and s[0] == "(" and s[-1] == ")":
+                s = s[1:-1].strip()
+            if len(s) == 1 and s.upper() in LETTER_TO_IDX:
+                idx = LETTER_TO_IDX[s.upper()]
+                return idx if 0 <= idx < num_candidates else None
+            for tok in s.replace("(", " ").replace(")", " ").split()[::-1]:
+                up = tok.upper()
+                if len(up) == 1 and up in LETTER_TO_IDX:
+                    idx = LETTER_TO_IDX[up]
+                    return idx if 0 <= idx < num_candidates else None
+            if choices and isinstance(choices, list):
+                s_norm = normalize_text(s)
+                for i, ch in enumerate(choices):
+                    if normalize_text(str(ch)) == s_norm:
+                        return i if 0 <= i < num_candidates else None
         return None
 
-
-def _total_ll(d: Dict[str, Any]) -> float:
-    """
-    Get a comparable total log-likelihood for an option.
-    Prefer 'total_loglikelihood'; else fall back to sum(logprobs).
-    """
-    if "total_loglikelihood" in d and d["total_loglikelihood"] is not None:
-        return float(d["total_loglikelihood"])
-    lps = d.get("logprobs")
-    if isinstance(lps, list) and lps:
-        try:
-            return float(sum(lps))
-        except Exception:
-            pass
-    return float("-inf")  # so it never wins argmax
-
-
-def _target_to_index(record: Dict[str, Any]) -> int:
-    """
-    Convert various target formats to a 0-based index.
-    Accepts integers, numeric strings ("0"), letter labels ("A", "(C)"),
-    or falls back to record['doc']['answer'] if needed.
-    """
-    def _letter_to_idx(s: str) -> int | None:
-        m = re.search(r"([A-Za-z])", s)
-        if not m:
-            return None
-        return ord(m.group(1).upper()) - ord("A")
-
-    # Primary: record['target']
-    tgt = record.get("target")
-    if isinstance(tgt, int):
-        return tgt
-    if isinstance(tgt, str):
-        s = tgt.strip()
-        if re.fullmatch(r"-?\d+", s):
-            return int(s)
-        idx = _letter_to_idx(s)
+    for cand in [record.get("target"), record.get("doc", {}).get("answer"), record.get("doc", {}).get("target")]:
+        idx = try_coerce(cand)
         if idx is not None:
             return idx
-
-    # Fallback: record['doc']['answer']
-    doc_ans = record.get("doc", {}).get("answer")
-    if isinstance(doc_ans, int):
-        return doc_ans
-    if isinstance(doc_ans, str):
-        s = doc_ans.strip()
-        if re.fullmatch(r"-?\d+", s):
-            return int(s)
-        idx = _letter_to_idx(s)
-        if idx is not None:
-            return idx
-
-    raise ValueError("Could not determine target index from record")
+    return None
 
 
-def process_results(base_dir: str):
-    """
-    Walk the model directories under base_dir, read all .jsonl result files,
-    and return a nested dict: model -> task -> DataFrame with columns:
-      doc_id, avg_logprobs, avg_token_entropy, correct
+def best_pred_index(resp_dicts: List[Dict[str, Any]]) -> Optional[int]:
+    if not resp_dicts:
+        return None
+    best_i = 0
+    best_val = float("-inf")
+    for i, d in enumerate(resp_dicts):
+        val = d.get("total_loglikelihood", float("-inf"))
+        if val > best_val:
+            best_val = val
+            best_i = i
+    return best_i
+
+
+def process_results(base_dir: str, drop_unresolved: bool = False):
+    """Return {model: {task: DataFrame}} where each DF has two rows per doc: role in {gt, pred}.
+    Columns: doc_id, role, avg_logprobs, avg_token_entropy, entropy_weighted_avg_logprobs, correct.
     """
     model_data: Dict[str, Dict[str, pd.DataFrame]] = {}
     progress_bar = tqdm(total=len(os.listdir(base_dir)))
@@ -114,77 +125,91 @@ def process_results(base_dir: str):
             continue
 
         for file in os.listdir(model_path):
-            if not file.endswith(".jsonl"):
+            if not (file.endswith(".jsonl") and file.startswith("samples_")):
                 continue
 
             progress_bar.set_description(f"Processing {model_name}/{file}")
 
-            task_name = _extract_task_name(file)
+            task_name = extract_task_name(file)
             file_path = os.path.join(model_path, file)
 
+            rows: List[Dict[str, Any]] = []
             with open(file_path, "r", encoding="utf-8") as f:
-                records = [json.loads(line) for line in f if line.strip()]
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
 
-            rows = []
-            for record in records:
-                doc_id = record.get("doc_id")
+                    doc_id = record.get("doc_id")
+                    resp_dicts = get_candidate_resps(record)
+                    if not resp_dicts:
+                        if not drop_unresolved:
+                            for role in ("gt", "pred"):
+                                rows.append({
+                                    "doc_id": doc_id,
+                                    "role": role,
+                                    "avg_logprobs": pd.NA,
+                                    "avg_token_entropy": pd.NA,
+                                    "entropy_weighted_avg_logprobs": pd.NA,
+                                    "correct": pd.NA,
+                                })
+                        continue
 
-                # Prefer filtered_resps; fallback to resps
-                raw_frs = record.get("filtered_resps")
-                if raw_frs is None and "resps" in record:
-                    raw_frs = record["resps"]
-                if raw_frs is None:
-                    continue  # skip if responses are missing
+                    gt_idx = resolve_correct_index(record, len(resp_dicts))
+                    pred_idx = best_pred_index(resp_dicts)
 
-                try:
-                    filtered_resps = [_to_resp_dict(x) for x in raw_frs]
-                except Exception:
-                    continue  # skip malformed responses
+                    correct_flag = (
+                        None if gt_idx is None or pred_idx is None else int(pred_idx == gt_idx)
+                    )
 
-                # Determine correct target index (supports ints and letters)
-                try:
-                    target_idx = _target_to_index(record)
-                except Exception:
-                    continue
+                    def stats_for(idx: Optional[int]) -> Dict[str, Any]:
+                        if idx is None:
+                            return {
+                                "avg_logprobs": pd.NA,
+                                "avg_token_entropy": pd.NA,
+                                "entropy_weighted_avg_logprobs": pd.NA,
+                            }
+                        resp = resp_dicts[idx]
+                        lp = resp.get("logprobs", []) or []
+                        ent = resp.get("entropies", []) or []
+                        return {
+                            "avg_logprobs": (sum(lp) / len(lp)) if lp else pd.NA,
+                            "avg_token_entropy": (sum(ent) / len(ent)) if ent else pd.NA,
+                            "entropy_weighted_avg_logprobs": _entropy_weighted_avg_logprobs(lp, ent),
+                        }
 
-                if not (0 <= target_idx < len(filtered_resps)):
-                    continue  # out-of-range target
+                    # GT row
+                    rows.append({
+                        "doc_id": doc_id,
+                        "role": "gt",
+                        **stats_for(gt_idx),
+                        "correct": pd.NA if correct_flag is None else correct_flag,
+                    })
 
-                correct_resp = filtered_resps[target_idx]
-
-                # Averages
-                avg_logprobs = _safe_mean(correct_resp.get("logprobs", []))
-                avg_entropy = _safe_mean(correct_resp.get("entropies", []))
-
-                # Predicted = argmax of total log-likelihood (higher is better)
-                totals = [_total_ll(r) for r in filtered_resps]
-                try:
-                    best_idx = max(range(len(totals)), key=lambda i: totals[i])
-                except ValueError:
-                    continue  # empty totals
-
-                correct = 1 if best_idx == target_idx else 0
-
-                rows.append({
-                    "doc_id": doc_id,
-                    "avg_logprobs": avg_logprobs,
-                    "avg_token_entropy": avg_entropy,
-                    "correct": correct
-                })
+                    # Pred row
+                    rows.append({
+                        "doc_id": doc_id,
+                        "role": "pred",
+                        **stats_for(pred_idx),
+                        "correct": pd.NA if correct_flag is None else correct_flag,
+                    })
 
             df = pd.DataFrame(rows)
             model_data.setdefault(model_name, {})[task_name] = df
-        
+
         progress_bar.update(1)
 
     return model_data
 
 
 if __name__ == "__main__":
-    base_dir = "results_scratch"  # <-- set to your top-level results directory
+    base_dir = "results_scratch"  # replace with your top-level directory path
     results = process_results(base_dir)
 
-    # Save per-model, per-task dataframes
     for model, tasks in results.items():
         for task, df in tasks.items():
             out_dir = os.path.join("processed_results", model)
