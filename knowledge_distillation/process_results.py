@@ -13,6 +13,7 @@ def process_results(base_dir):
             continue
 
         for file in os.listdir(model_path):
+            print(file)
             if not file.endswith(".jsonl"):
                 continue
 
