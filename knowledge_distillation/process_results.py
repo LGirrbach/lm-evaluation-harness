@@ -2,6 +2,8 @@ import os
 import re
 import json
 import pandas as pd
+
+from tqdm import tqdm
 from ast import literal_eval
 from typing import Any, Dict, List
 
@@ -104,6 +106,7 @@ def process_results(base_dir: str):
       doc_id, avg_logprobs, avg_token_entropy, correct
     """
     model_data: Dict[str, Dict[str, pd.DataFrame]] = {}
+    progress_bar = tqdm(total=len(os.listdir(base_dir)))
 
     for model_name in os.listdir(base_dir):
         model_path = os.path.join(base_dir, model_name)
@@ -113,6 +116,8 @@ def process_results(base_dir: str):
         for file in os.listdir(model_path):
             if not file.endswith(".jsonl"):
                 continue
+
+            progress_bar.set_description(f"Processing {model_name}/{file}")
 
             task_name = _extract_task_name(file)
             file_path = os.path.join(model_path, file)
@@ -169,6 +174,8 @@ def process_results(base_dir: str):
 
             df = pd.DataFrame(rows)
             model_data.setdefault(model_name, {})[task_name] = df
+        
+        progress_bar.update(1)
 
     return model_data
 
