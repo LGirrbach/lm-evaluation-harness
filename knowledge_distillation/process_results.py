@@ -114,7 +114,8 @@ def best_pred_index(resp_dicts: List[Dict[str, Any]]) -> Optional[int]:
 
 def process_results(base_dir: str, drop_unresolved: bool = False):
     """Return {model: {task: DataFrame}} where each DF has two rows per doc: role in {gt, pred}.
-    Columns: doc_id, role, avg_logprobs, avg_token_entropy, entropy_weighted_avg_logprobs, correct.
+    Columns: doc_id, role, avg_logprobs, avg_token_entropy, entropy_weighted_avg_logprobs,
+             total_loglikelihood, num_tokens, correct.
     """
     model_data: Dict[str, Dict[str, pd.DataFrame]] = {}
     progress_bar = tqdm(total=len(os.listdir(base_dir)))
@@ -155,6 +156,8 @@ def process_results(base_dir: str, drop_unresolved: bool = False):
                                     "avg_logprobs": pd.NA,
                                     "avg_token_entropy": pd.NA,
                                     "entropy_weighted_avg_logprobs": pd.NA,
+                                    "total_loglikelihood": pd.NA,
+                                    "num_tokens": pd.NA,
                                     "correct": pd.NA,
                                 })
                         continue
@@ -172,14 +175,19 @@ def process_results(base_dir: str, drop_unresolved: bool = False):
                                 "avg_logprobs": pd.NA,
                                 "avg_token_entropy": pd.NA,
                                 "entropy_weighted_avg_logprobs": pd.NA,
+                                "total_loglikelihood": pd.NA,
+                                "num_tokens": pd.NA,
                             }
                         resp = resp_dicts[idx]
                         lp = resp.get("logprobs", []) or []
                         ent = resp.get("entropies", []) or []
+                        total_ll = resp.get("total_loglikelihood", pd.NA)
                         return {
                             "avg_logprobs": (sum(lp) / len(lp)) if lp else pd.NA,
                             "avg_token_entropy": (sum(ent) / len(ent)) if ent else pd.NA,
                             "entropy_weighted_avg_logprobs": _entropy_weighted_avg_logprobs(lp, ent),
+                            "total_loglikelihood": total_ll,
+                            "num_tokens": len(lp),
                         }
 
                     # GT row
