@@ -2,11 +2,28 @@
 """
 Parse evaluation result JSONL files for multiple LLMs into CSVs.
 
-Changes vs v1:
-- Store IDENTIFIERS (candidate indices) instead of full answer texts.
-- Add exact score columns for the selected predictions:
-    * predicted_total_loglikelihood
-    * predicted_avg_token_loglikelihood
+This version adds:
+- doc_id column
+- columns listing *all* answer candidates and their scores (IDs-only to respect
+  the "no full answer text" requirement):
+    * n_options
+    * all_answer_ids (pipe-separated)
+    * all_total_loglikelihoods (pipe-separated, aligned with IDs)
+    * all_avg_token_loglikelihoods (pipe-separated, aligned)
+
+We *keep* the predicted/ground-truth identifier columns for easy downstream processing:
+  model,
+  task,
+  doc_id,
+  predicted_answer_id_total_loglikelihood,
+  predicted_total_loglikelihood,
+  predicted_answer_id_avg_token_likelihood,
+  predicted_avg_token_loglikelihood,
+  ground_truth_id,
+  n_options,
+  all_answer_ids,
+  all_total_loglikelihoods,
+  all_avg_token_loglikelihoods
 
 Folder layout (assumed):
 ROOT/
@@ -18,40 +35,10 @@ ROOT/
     other_task.jsonl
   ...
 
-For each *.jsonl file, this script writes a sibling .csv (or mirrors to --outdir)
-with columns:
-  model,
-  task,
-  predicted_answer_id_total_loglikelihood,
-  predicted_total_loglikelihood,
-  predicted_answer_id_avg_token_likelihood,
-  predicted_avg_token_loglikelihood,
-  ground_truth_id
-
-Prediction selection rules:
-- Each JSONL line encodes multiple candidate answers via arguments.gen_args_0..N
-  (their texts in arg_1) and their scores in filtered_resps (preferred) or resps.
-- "predicted_answer_id_total_loglikelihood" is the index of the candidate with
-  the highest total_loglikelihood.
-- "predicted_answer_id_avg_token_likelihood" is the index of the candidate with
-  the highest average log-likelihood per token (total / number_of_tokens).
-
-Ground truth rules:
-- If top-level "target" is an int or numeric string, it is treated as the
-  index into the candidate list (0-based) and saved directly.
-- Otherwise we try to match the textual target (e.g., "yes" or option text) to
-  one of the candidates (case/punct-insensitive). If a match is found, we save
-  that index; else we save an empty value.
-
-Robustness:
-- Handles both "filtered_resps" (list[str]) and "resps" (list[list[str]]).
-- Safely parses Python-literal-looking dict strings using ast.literal_eval.
-- Ignores malformed lines but logs them.
-
 Usage:
-  python parse_llm_jsonl_to_csv_ids_scores.py /path/to/ROOT
-  python parse_llm_jsonl_to_csv_ids_scores.py /path/to/ROOT --outdir /path/to/OUTPUT_ROOT
-  python parse_llm_jsonl_to_csv_ids_scores.py /path/to/ROOT --pattern "**/*.jsonl" --overwrite
+  python parse_llm_jsonl_to_csv_docid_all.py /path/to/ROOT
+  python parse_llm_jsonl_to_csv_docid_all.py /path/to/ROOT --outdir /path/to/OUTPUT_ROOT
+  python parse_llm_jsonl_to_csv_docid_all.py /path/to/ROOT --overwrite
 
 """
 from __future__ import annotations
@@ -60,6 +47,7 @@ import argparse
 import ast
 import csv
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -88,7 +76,7 @@ def sorted_gen_args(arguments: Dict[str, Any]) -> List[str]:
 def extract_options(record: Dict[str, Any]) -> List[str]:
     """Extract candidate answer texts from arguments.gen_args_*.arg_1.
 
-    Falls back to empty list if not present.
+    We return the texts (for matching), but we do NOT write texts to CSV.
     """
     arguments = record.get("arguments") or {}
     opts: List[str] = []
@@ -106,7 +94,7 @@ def parse_resp_obj(obj: Any) -> Optional[Dict[str, Any]]:
     """Parse a single response entry into a dict with total_loglikelihood and logprobs.
 
     The JSON often stores Python-literal strings like: "{'total_loglikelihood': -0.5, ...}".
-    We use ast.literal_eval for safety.
+    We use ast.literal_eval for safety and fall back to json.loads.
     """
     if obj is None:
         return None
@@ -132,6 +120,7 @@ def extract_candidate_scores(record: Dict[str, Any], num_options: int) -> List[T
     """Return list of (total_loglikelihood, token_count) per candidate.
 
     Prefers filtered_resps; falls back to resps.
+    Missing/invalid entries get (-inf, 0).
     """
     scores: List[Tuple[float, int]] = []
 
@@ -171,14 +160,7 @@ def choose_indices(scores: List[Tuple[float, int]]) -> Tuple[int, int]:
 
 
 def ground_truth_id(record: Dict[str, Any], options: List[str]) -> str:
-    """Derive the ground-truth identifier (candidate index as string).
-
-    Priority:
-      1) If target is an int (or numeric string), return it if in-range.
-      2) Else, try to match textual target to an option ignoring case/punct and return that index.
-      3) Else, try single-letter label mapping (A-D -> 0-3).
-      4) Else, return empty string.
-    """
+    """Derive the ground-truth identifier (candidate index as string)."""
     target = record.get("target")
 
     # 1) index-like targets (e.g., "3", 0)
@@ -261,32 +243,61 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
             pred_id_avg = str(idx_avg) if idx_avg >= 0 else ""
             gt_id = ground_truth_id(record, options)
 
-            # scores
+            # scores for the chosen ones
             total_ll = scores[idx_total][0] if 0 <= idx_total < len(scores) else ""
             avg_ll = (
                 (scores[idx_avg][0] / max(1, scores[idx_avg][1]))
                 if 0 <= idx_avg < len(scores) else ""
             )
 
+            # doc_id (best-effort)
+            doc_id = record.get("doc_id")
+            if doc_id is None:
+                doc = record.get("doc") or {}
+                doc_id = doc.get("doc_id") or doc.get("id")
+
+            # all-answers columns (pipe-separated)
+            n_opts = len(options)
+            ids = [str(i) for i in range(n_opts)]
+            totals = []
+            avgs = []
+            for total, tok in scores:
+                if total is None or (isinstance(total, float) and math.isinf(total)):
+                    totals.append("")
+                    avgs.append("")
+                else:
+                    totals.append(str(total))
+                    avgs.append(str(total / max(1, tok)))
+
             rows.append([
                 model,
                 task,
+                doc_id if doc_id is not None else "",
                 pred_id_total,
                 total_ll,
                 pred_id_avg,
                 avg_ll,
                 gt_id,
+                n_opts,
+                "|".join(ids),
+                "|".join(totals),
+                "|".join(avgs),
             ])
 
     # Write CSV
     header = [
         "model",
         "task",
+        "doc_id",
         "predicted_answer_id_total_loglikelihood",
         "predicted_total_loglikelihood",
         "predicted_answer_id_avg_token_likelihood",
         "predicted_avg_token_loglikelihood",
         "ground_truth_id",
+        "n_options",
+        "all_answer_ids",
+        "all_total_loglikelihoods",
+        "all_avg_token_loglikelihoods",
     ]
 
     with out_path.open("w", encoding="utf-8", newline="") as fo:
@@ -301,10 +312,9 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
 # ----------------------------- cli -------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Parse LLM evaluation JSONL files into CSVs (IDs + scores).")
+    ap = argparse.ArgumentParser(description="Parse LLM evaluation JSONL files into CSVs (doc_id + all answers + scores, IDs-only).")
     ap.add_argument("root", type=Path, help="Root directory containing per-model subfolders with JSONL files.")
     ap.add_argument("--outdir", type=Path, default=None, help="Optional output root directory to mirror structure into.")
-    ap.add_argument("--pattern", type=str, default="**/*.jsonl", help="Glob pattern (relative to each model folder) to find files. Default: **/*.jsonl")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing CSVs.")
 
     args = ap.parse_args()
