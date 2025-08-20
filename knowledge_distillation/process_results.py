@@ -2,44 +2,33 @@
 """
 Parse evaluation result JSONL files for multiple LLMs into CSVs.
 
-This version adds:
-- doc_id column
-- columns listing *all* answer candidates and their scores (IDs-only to respect
-  the "no full answer text" requirement):
-    * n_options
-    * all_answer_ids (pipe-separated)
-    * all_total_loglikelihoods (pipe-separated, aligned with IDs)
-    * all_avg_token_loglikelihoods (pipe-separated, aligned)
+This version adds per-candidate *confidence features* based on token-level
+log-probabilities (and optional token entropies) using the provided formulas.
 
-We *keep* the predicted/ground-truth identifier columns for easy downstream processing:
-  model,
-  task,
-  doc_id,
-  predicted_answer_id_total_loglikelihood,
-  predicted_total_loglikelihood,
-  predicted_answer_id_avg_token_likelihood,
-  predicted_avg_token_loglikelihood,
-  ground_truth_id,
-  n_options,
-  all_answer_ids,
-  all_total_loglikelihoods,
-  all_avg_token_loglikelihoods
+New per-row columns (pipe-separated, index-aligned with all_answer_ids):
+  - all_softmin_tau
+  - all_cvar_alpha
+  - all_entropy_weighted_mean
+  - all_last_k_mean
+  - all_typicality_mad
+  - all_typicality_frac_above
 
-Folder layout (assumed):
-ROOT/
-  model_A/
-    task1.jsonl
-    task2.jsonl
-  model_B/
-    task1.jsonl
-    other_task.jsonl
-  ...
+We keep the previously added columns:
+  model, task, doc_id,
+  predicted_* (IDs and exact scores), ground_truth_id,
+  n_options, all_answer_ids, all_total_loglikelihoods, all_avg_token_loglikelihoods
+
+Optional CLI hyperparameters to control the new scores:
+  --tau  (softmin temperature, default 0.1)
+  --alpha (CVaR tail fraction, default 0.1)
+  --k-last (last-k mean window, default 20)
+  --beta (entropy-weighted mean exponent, default 1.0)
+  --kappa (typicality threshold in nats, default 1.0)
 
 Usage:
-  python parse_llm_jsonl_to_csv_docid_all.py /path/to/ROOT
-  python parse_llm_jsonl_to_csv_docid_all.py /path/to/ROOT --outdir /path/to/OUTPUT_ROOT
-  python parse_llm_jsonl_to_csv_docid_all.py /path/to/ROOT --overwrite
-
+  python parse_llm_jsonl_to_csv_extras.py /path/to/ROOT \
+    --outdir /path/to/OUTPUT_ROOT --overwrite \
+    --tau 0.1 --alpha 0.1 --k-last 20 --beta 1.0 --kappa 1.0
 """
 from __future__ import annotations
 
@@ -115,6 +104,171 @@ def parse_resp_obj(obj: Any) -> Optional[Dict[str, Any]]:
                 return None
     return None
 
+# ---------- Confidence feature functions (as provided) ------------------
+
+def softmin_score(log_probs, entropies=None, tau=0.1):
+    """
+    Soft-min aggregation of token log-probabilities.
+    As tau -> 0, approaches min(log_probs). Higher is better.
+    """
+    lp = list(log_probs)
+    if not lp: raise ValueError("log_probs is empty")
+    if tau <= 0: raise ValueError("tau must be > 0")
+    a = [(-x)/tau for x in lp]                 # a_i = -logp_i / tau
+    a_max = max(a)                             # for numerical stability
+    return -tau * (a_max + math.log(sum(math.exp(ai - a_max) for ai in a)))
+
+def cvar_score(log_probs, entropies=None, alpha=0.1):
+    """
+    CVaR over the worst alpha-fraction of tokens (tail-focused mean).
+    Example: alpha=0.1 averages the bottom 10% lowest log-probs.
+    Higher is better, but it focuses on the brittle tail.
+    """
+    lp = sorted(list(log_probs))               # ascending; worst first
+    if not lp: raise ValueError("log_probs is empty")
+    if not (0 < alpha <= 1): raise ValueError("alpha must be in (0,1]")
+    n = len(lp)
+    k = max(1, math.ceil(alpha * n))
+    tail = lp[:k]
+    return sum(tail) / len(tail)
+
+def entropy_weighted_mean_logprob(log_probs, entropies=None, beta=1.0, eps=1e-12):
+    """
+    Entropy-weighted mean of log-probs: weights w_t ∝ (H_t)^beta.
+    Set beta>0 to emphasize uncertain positions; beta=0 reduces to a plain mean.
+    If `entropies` is None, returns the plain mean.
+    """
+    lp = list(log_probs)
+    if not lp: raise ValueError("log_probs is empty")
+    if entropies is None or beta == 0:
+        return sum(lp) / len(lp)
+    H = list(entropies)
+    if len(H) != len(lp): raise ValueError("entropies must match length of log_probs")
+    weights = [(max(h, 0.0) + eps) ** beta for h in H]
+    Z = sum(weights)
+    return sum(w * x for w, x in zip(weights, lp)) / Z
+
+def last_k_mean_logprob(log_probs, entropies=None, k=20):
+    """
+    Mean log-probability over the last k tokens (or all if shorter).
+    Useful to focus on the final commitment span.
+    """
+    lp = list(log_probs)
+    if not lp: raise ValueError("log_probs is empty")
+    if k is None or k <= 0: raise ValueError("k must be positive")
+    segment = lp[-k:] if k < len(lp) else lp
+    return sum(segment) / len(segment)
+
+def typicality_mad(log_probs, entropies=None):
+    """
+    Mean absolute deviation of surprisal from a reference entropy.
+    surprisal s_t = -log p_t
+      - If entropies provided: mean |s_t - H_t| (typical-sampling style)
+      - Else: mean |s_t - mean(s)| (sequence-relative typicality)
+    Lower is better (more typical).
+    """
+    lp = list(log_probs)
+    if not lp: raise ValueError("log_probs is empty")
+    s = [-x for x in lp]
+    if entropies is not None:
+        H = list(entropies)
+        if len(H) != len(lp): raise ValueError("entropies must match length of log_probs")
+        devs = [abs(si - hi) for si, hi in zip(s, H)]
+    else:
+        mu = sum(s) / len(s)
+        devs = [abs(si - mu) for si in s]
+    return sum(devs) / len(devs)
+
+def typicality_fraction_above(log_probs, entropies=None, kappa=1.0):
+    """
+    Fraction of tokens whose surprisal deviates from the reference entropy
+    by more than kappa (in nats).
+      - If entropies provided: uses per-step H_t
+      - Else: uses sequence mean surprisal
+    Lower is better.
+    """
+    lp = list(log_probs)
+    if not lp: raise ValueError("log_probs is empty")
+    s = [-x for x in lp]
+    if entropies is not None:
+        H = list(entropies)
+        if len(H) != len(lp): raise ValueError("entropies must match length of log_probs")
+        devs = [abs(si - hi) for si, hi in zip(s, H)]
+    else:
+        mu = sum(s) / len(s)
+        devs = [abs(si - mu) for si in s]
+    return sum(d > kappa for d in devs) / len(devs)
+
+def compute_confidence_features(
+    log_probs,
+    entropies=None,
+    *,
+    tau=0.1,
+    alpha=0.1,
+    k_last=20,
+    beta=1.0,
+    kappa=1.0
+):
+    """
+    Convenience wrapper: returns all the above scores in a dict.
+    """
+    return {
+        "softmin_tau": softmin_score(log_probs, entropies, tau=tau),
+        "cvar_alpha": cvar_score(log_probs, entropies, alpha=alpha),
+        "entropy_weighted_mean": entropy_weighted_mean_logprob(log_probs, entropies, beta=beta),
+        "last_k_mean": last_k_mean_logprob(log_probs, entropies, k=k_last),
+        "typicality_mad": typicality_mad(log_probs, entropies),
+        "typicality_frac_above": typicality_fraction_above(log_probs, entropies, kappa=kappa),
+    }
+
+# --------------------- extraction & aggregation utils -------------------
+
+def coerce_num_list(x: Any) -> Optional[List[float]]:
+    if isinstance(x, (list, tuple)):
+        out: List[float] = []
+        for v in x:
+            try:
+                out.append(float(v))
+            except Exception:
+                return None
+        return out
+    return None
+
+
+def extract_candidate_series(record: Dict[str, Any], num_options: int) -> List[Tuple[Optional[List[float]], Optional[List[float]]]]:
+    """Return list of (log_probs, entropies) per candidate if available, else (None, None)."""
+    series: List[Tuple[Optional[List[float]], Optional[List[float]]]] = []
+
+    src = record.get("filtered_resps")
+    if not src:
+        src = record.get("resps")
+
+    if not isinstance(src, Sequence):
+        src = []
+
+    for i in range(num_options):
+        entry = None
+        if i < len(src):
+            entry = src[i]
+        resp = parse_resp_obj(entry)
+        if resp is None:
+            series.append((None, None))
+            continue
+        lp = coerce_num_list(resp.get("logprobs"))
+        # entropies sometimes under different keys
+        ent = resp.get("entropies")
+        if ent is None:
+            ent = resp.get("token_entropies")
+        ent = coerce_num_list(ent)
+        if lp is None:
+            series.append((None, None))
+        else:
+            # if entropies exist but wrong length, drop them
+            if ent is not None and len(ent) != len(lp):
+                ent = None
+            series.append((lp, ent))
+    return series
+
 
 def extract_candidate_scores(record: Dict[str, Any], num_options: int) -> List[Tuple[float, int]]:
     """Return list of (total_loglikelihood, token_count) per candidate.
@@ -145,7 +299,7 @@ def extract_candidate_scores(record: Dict[str, Any], num_options: int) -> List[T
         except Exception:
             total_f = float("-inf")
         logprobs = resp.get("logprobs")
-        tok_count = len(logprobs) if isinstance(logprobs, Sequence) else 1
+        tok_count = len(logprobs) if isinstance(logprobs, (list, tuple)) else 1
         scores.append((total_f, tok_count))
     return scores
 
@@ -203,7 +357,18 @@ def derive_model_and_task(root: Path, file_path: Path) -> Tuple[str, str]:
 
 # ----------------------------- core ------------------------------------
 
-def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], overwrite: bool = False) -> Optional[Path]:
+def process_jsonl_file(
+    root: Path,
+    file_path: Path,
+    outdir: Optional[Path],
+    *,
+    overwrite: bool = False,
+    tau: float = 0.1,
+    alpha: float = 0.1,
+    k_last: int = 20,
+    beta: float = 1.0,
+    kappa: float = 1.0,
+) -> Optional[Path]:
     model, task = derive_model_and_task(root, file_path)
 
     # Output path
@@ -235,7 +400,11 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
                     continue
 
             options = extract_options(record)
-            scores = extract_candidate_scores(record, len(options))
+            n_opts = len(options)
+
+            # core scores and token series
+            scores = extract_candidate_scores(record, n_opts)
+            series = extract_candidate_series(record, n_opts)
             idx_total, idx_avg = choose_indices(scores)
 
             # identifiers
@@ -257,17 +426,51 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
                 doc_id = doc.get("doc_id") or doc.get("id")
 
             # all-answers columns (pipe-separated)
-            n_opts = len(options)
             ids = [str(i) for i in range(n_opts)]
-            totals = []
-            avgs = []
-            for total, tok in scores:
+            totals: List[str] = []
+            avgs: List[str] = []
+            softmins: List[str] = []
+            cvars: List[str] = []
+            ewm_means: List[str] = []
+            lastk_means: List[str] = []
+            typ_mads: List[str] = []
+            typ_fracs: List[str] = []
+
+            for (total, tok_cnt), (lp, ent) in zip(scores, series):
                 if total is None or (isinstance(total, float) and math.isinf(total)):
                     totals.append("")
                     avgs.append("")
                 else:
                     totals.append(str(total))
-                    avgs.append(str(total / max(1, tok)))
+                    avgs.append(str(total / max(1, tok_cnt)))
+
+                # Confidence features
+                if lp is None or len(lp) == 0:
+                    softmins.append("")
+                    cvars.append("")
+                    ewm_means.append("")
+                    lastk_means.append("")
+                    typ_mads.append("")
+                    typ_fracs.append("")
+                else:
+                    try:
+                        feats = compute_confidence_features(
+                            lp, ent,
+                            tau=tau, alpha=alpha, k_last=k_last, beta=beta, kappa=kappa
+                        )
+                        softmins.append(str(feats["softmin_tau"]))
+                        cvars.append(str(feats["cvar_alpha"]))
+                        ewm_means.append(str(feats["entropy_weighted_mean"]))
+                        lastk_means.append(str(feats["last_k_mean"]))
+                        typ_mads.append(str(feats["typicality_mad"]))
+                        typ_fracs.append(str(feats["typicality_frac_above"]))
+                    except Exception:
+                        softmins.append("")
+                        cvars.append("")
+                        ewm_means.append("")
+                        lastk_means.append("")
+                        typ_mads.append("")
+                        typ_fracs.append("")
 
             rows.append([
                 model,
@@ -282,6 +485,12 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
                 "|".join(ids),
                 "|".join(totals),
                 "|".join(avgs),
+                "|".join(softmins),
+                "|".join(cvars),
+                "|".join(ewm_means),
+                "|".join(lastk_means),
+                "|".join(typ_mads),
+                "|".join(typ_fracs),
             ])
 
     # Write CSV
@@ -298,7 +507,16 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
         "all_answer_ids",
         "all_total_loglikelihoods",
         "all_avg_token_loglikelihoods",
+        "all_softmin_tau",
+        "all_cvar_alpha",
+        "all_entropy_weighted_mean",
+        "all_last_k_mean",
+        "all_typicality_mad",
+        "all_typicality_frac_above",
     ]
+
+    if out_path.exists() and not overwrite:
+        pass  # already handled above; kept for clarity
 
     with out_path.open("w", encoding="utf-8", newline="") as fo:
         w = csv.writer(fo)
@@ -312,10 +530,17 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
 # ----------------------------- cli -------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Parse LLM evaluation JSONL files into CSVs (doc_id + all answers + scores, IDs-only).")
+    ap = argparse.ArgumentParser(description="Parse LLM evaluation JSONL files into CSVs (IDs + scores + confidence features).")
     ap.add_argument("root", type=Path, help="Root directory containing per-model subfolders with JSONL files.")
     ap.add_argument("--outdir", type=Path, default=None, help="Optional output root directory to mirror structure into.")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing CSVs.")
+
+    # hyperparameters for confidence features
+    ap.add_argument("--tau", type=float, default=0.1)
+    ap.add_argument("--alpha", type=float, default=0.1)
+    ap.add_argument("--k-last", type=int, default=20)
+    ap.add_argument("--beta", type=float, default=1.0)
+    ap.add_argument("--kappa", type=float, default=1.0)
 
     args = ap.parse_args()
 
@@ -332,7 +557,15 @@ def main():
 
     for fp in files:
         try:
-            process_jsonl_file(root, fp, outdir=outdir, overwrite=args.overwrite)
+            process_jsonl_file(
+                root, fp, outdir,
+                overwrite=args.overwrite,
+                tau=args.tau,
+                alpha=args.alpha,
+                k_last=args.k_last,
+                beta=args.beta,
+                kappa=args.kappa,
+            )
         except Exception as e:
             print(f"[error] Failed to process {fp}: {e}")
 
