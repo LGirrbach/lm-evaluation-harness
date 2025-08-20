@@ -2,6 +2,12 @@
 """
 Parse evaluation result JSONL files for multiple LLMs into CSVs.
 
+Changes vs v1:
+- Store IDENTIFIERS (candidate indices) instead of full answer texts.
+- Add exact score columns for the selected predictions:
+    * predicted_total_loglikelihood
+    * predicted_avg_token_loglikelihood
+
 Folder layout (assumed):
 ROOT/
   model_A/
@@ -14,23 +20,28 @@ ROOT/
 
 For each *.jsonl file, this script writes a sibling .csv (or mirrors to --outdir)
 with columns:
-  model, task, predicted_answer_total_loglikelihood,
-  predicted_answer_avg_token_likelihood, ground_truth_answer
+  model,
+  task,
+  predicted_answer_id_total_loglikelihood,
+  predicted_total_loglikelihood,
+  predicted_answer_id_avg_token_likelihood,
+  predicted_avg_token_loglikelihood,
+  ground_truth_id
 
 Prediction selection rules:
 - Each JSONL line encodes multiple candidate answers via arguments.gen_args_0..N
-  and their scores in filtered_resps (preferred) or resps.
-- "predicted_answer_total_loglikelihood" selects the candidate with the highest
-  total_loglikelihood.
-- "predicted_answer_avg_token_likelihood" selects the candidate with the highest
-  average log-likelihood per token (total / number_of_tokens).
+  (their texts in arg_1) and their scores in filtered_resps (preferred) or resps.
+- "predicted_answer_id_total_loglikelihood" is the index of the candidate with
+  the highest total_loglikelihood.
+- "predicted_answer_id_avg_token_likelihood" is the index of the candidate with
+  the highest average log-likelihood per token (total / number_of_tokens).
 
 Ground truth rules:
-- If top-level "target" is an integer or numeric string, it is treated as the
-  index into the candidate list (0-based).
-- Otherwise we try to match the textual target (e.g., "yes") to one of the
-  candidate texts (case-insensitive, punctuation-insensitive). If no match is
-  found, we keep the raw target value.
+- If top-level "target" is an int or numeric string, it is treated as the
+  index into the candidate list (0-based) and saved directly.
+- Otherwise we try to match the textual target (e.g., "yes" or option text) to
+  one of the candidates (case/punct-insensitive). If a match is found, we save
+  that index; else we save an empty value.
 
 Robustness:
 - Handles both "filtered_resps" (list[str]) and "resps" (list[list[str]]).
@@ -38,9 +49,9 @@ Robustness:
 - Ignores malformed lines but logs them.
 
 Usage:
-  python parse_llm_jsonl_to_csv.py /path/to/ROOT
-  python parse_llm_jsonl_to_csv.py /path/to/ROOT --outdir /path/to/OUTPUT_ROOT
-  python parse_llm_jsonl_to_csv.py /path/to/ROOT --pattern "**/*.jsonl" --overwrite
+  python parse_llm_jsonl_to_csv_ids_scores.py /path/to/ROOT
+  python parse_llm_jsonl_to_csv_ids_scores.py /path/to/ROOT --outdir /path/to/OUTPUT_ROOT
+  python parse_llm_jsonl_to_csv_ids_scores.py /path/to/ROOT --pattern "**/*.jsonl" --overwrite
 
 """
 from __future__ import annotations
@@ -87,7 +98,6 @@ def extract_options(record: Dict[str, Any]) -> List[str]:
         if isinstance(ans, str):
             opts.append(ans.strip())
         else:
-            # Sometimes answers might be encoded differently; try to stringify
             opts.append(str(ans))
     return opts
 
@@ -108,11 +118,9 @@ def parse_resp_obj(obj: Any) -> Optional[Dict[str, Any]]:
             return None
     if isinstance(obj, str):
         s = obj.strip()
-        # If it's JSON-looking with single quotes, literal_eval works well.
         try:
             return ast.literal_eval(s)
         except Exception:
-            # Try JSON loads as a fallback (if it uses double quotes)
             try:
                 return json.loads(s)
             except Exception:
@@ -134,7 +142,6 @@ def extract_candidate_scores(record: Dict[str, Any], num_options: int) -> List[T
     if not isinstance(src, Sequence):
         src = []
 
-    # Ensure length matches options length when possible
     for i in range(num_options):
         entry = None
         if i < len(src):
@@ -144,9 +151,6 @@ def extract_candidate_scores(record: Dict[str, Any], num_options: int) -> List[T
             scores.append((float("-inf"), 0))
             continue
         total = resp.get("total_loglikelihood")
-        if total is None:
-            # Some variants might use another key; treat as missing
-            total = float("-inf")
         try:
             total_f = float(total)
         except Exception:
@@ -166,44 +170,44 @@ def choose_indices(scores: List[Tuple[float, int]]) -> Tuple[int, int]:
     return best_total, best_avg
 
 
-def ground_truth_text(record: Dict[str, Any], options: List[str]) -> str:
-    """Derive the ground-truth answer text.
+def ground_truth_id(record: Dict[str, Any], options: List[str]) -> str:
+    """Derive the ground-truth identifier (candidate index as string).
 
     Priority:
-      1) If target is an int (or numeric string), map to options[index] when possible.
-      2) Else, try to match textual target to an option ignoring case/punct.
-      3) Else, return the raw target as a string.
+      1) If target is an int (or numeric string), return it if in-range.
+      2) Else, try to match textual target to an option ignoring case/punct and return that index.
+      3) Else, try single-letter label mapping (A-D -> 0-3).
+      4) Else, return empty string.
     """
     target = record.get("target")
 
     # 1) index-like targets (e.g., "3", 0)
-    idx: Optional[int] = None
     if isinstance(target, (int, float)):
         idx = int(target)
+        if 0 <= idx < len(options):
+            return str(idx)
     elif isinstance(target, str):
         t = target.strip()
         if t.isdigit():
             idx = int(t)
-    if idx is not None and 0 <= idx < len(options):
-        return options[idx]
+            if 0 <= idx < len(options):
+                return str(idx)
 
-    # 2) textual target matching (yes/no or labels like A/B/C/D)
+    # 2) textual target matching
     if isinstance(target, str):
         t_norm = norm_text(target)
-        # Exact option text match
-        for opt in options:
+        for i, opt in enumerate(options):
             if norm_text(opt) == t_norm:
-                return opt
-        # Single-letter label mapping (A-D etc.)
+                return str(i)
+        # 3) A/B/C/D mapping
         if len(t_norm) == 1 and t_norm.isalpha():
             letter = t_norm.upper()
             pos = ord(letter) - ord('A')
             if 0 <= pos < len(options):
-                return options[pos]
-        return target
+                return str(pos)
 
-    # Fallback: stringify whatever it is
-    return str(target)
+    # 4) unknown
+    return ""
 
 
 def derive_model_and_task(root: Path, file_path: Path) -> Tuple[str, str]:
@@ -232,7 +236,7 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
         print(f"[skip] {out_path} exists. Use --overwrite to replace.")
         return out_path
 
-    rows: List[List[str]] = []
+    rows: List[List[Any]] = []
 
     with file_path.open("r", encoding="utf-8") as f:
         for ln, line in enumerate(f, start=1):
@@ -242,7 +246,6 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
-                # Some logs may contain single quotes at the top level; try literal_eval
                 try:
                     record = ast.literal_eval(line)
                 except Exception as e:
@@ -253,25 +256,37 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
             scores = extract_candidate_scores(record, len(options))
             idx_total, idx_avg = choose_indices(scores)
 
-            pred_total = options[idx_total] if 0 <= idx_total < len(options) else ""
-            pred_avg = options[idx_avg] if 0 <= idx_avg < len(options) else ""
-            gt = ground_truth_text(record, options)
+            # identifiers
+            pred_id_total = str(idx_total) if idx_total >= 0 else ""
+            pred_id_avg = str(idx_avg) if idx_avg >= 0 else ""
+            gt_id = ground_truth_id(record, options)
+
+            # scores
+            total_ll = scores[idx_total][0] if 0 <= idx_total < len(scores) else ""
+            avg_ll = (
+                (scores[idx_avg][0] / max(1, scores[idx_avg][1]))
+                if 0 <= idx_avg < len(scores) else ""
+            )
 
             rows.append([
                 model,
                 task,
-                pred_total,
-                pred_avg,
-                gt,
+                pred_id_total,
+                total_ll,
+                pred_id_avg,
+                avg_ll,
+                gt_id,
             ])
 
     # Write CSV
     header = [
         "model",
         "task",
-        "predicted_answer_total_loglikelihood",
-        "predicted_answer_avg_token_likelihood",
-        "ground_truth_answer",
+        "predicted_answer_id_total_loglikelihood",
+        "predicted_total_loglikelihood",
+        "predicted_answer_id_avg_token_likelihood",
+        "predicted_avg_token_loglikelihood",
+        "ground_truth_id",
     ]
 
     with out_path.open("w", encoding="utf-8", newline="") as fo:
@@ -286,7 +301,7 @@ def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], over
 # ----------------------------- cli -------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Parse LLM evaluation JSONL files into CSVs.")
+    ap = argparse.ArgumentParser(description="Parse LLM evaluation JSONL files into CSVs (IDs + scores).")
     ap.add_argument("root", type=Path, help="Root directory containing per-model subfolders with JSONL files.")
     ap.add_argument("--outdir", type=Path, default=None, help="Optional output root directory to mirror structure into.")
     ap.add_argument("--pattern", type=str, default="**/*.jsonl", help="Glob pattern (relative to each model folder) to find files. Default: **/*.jsonl")
@@ -300,7 +315,6 @@ def main():
     if not root.exists() or not root.is_dir():
         raise SystemExit(f"Root path not found or not a directory: {root}")
 
-    # Find all jsonl files under root
     files = sorted(root.rglob("*.jsonl"))
     if not files:
         print(f"[info] No JSONL files found under {root}")
