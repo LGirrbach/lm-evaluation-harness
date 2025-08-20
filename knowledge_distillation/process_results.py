@@ -1,225 +1,317 @@
-import os
+#!/usr/bin/env python3
+"""
+Parse evaluation result JSONL files for multiple LLMs into CSVs.
+
+Folder layout (assumed):
+ROOT/
+  model_A/
+    task1.jsonl
+    task2.jsonl
+  model_B/
+    task1.jsonl
+    other_task.jsonl
+  ...
+
+For each *.jsonl file, this script writes a sibling .csv (or mirrors to --outdir)
+with columns:
+  model, task, predicted_answer_total_loglikelihood,
+  predicted_answer_avg_token_likelihood, ground_truth_answer
+
+Prediction selection rules:
+- Each JSONL line encodes multiple candidate answers via arguments.gen_args_0..N
+  and their scores in filtered_resps (preferred) or resps.
+- "predicted_answer_total_loglikelihood" selects the candidate with the highest
+  total_loglikelihood.
+- "predicted_answer_avg_token_likelihood" selects the candidate with the highest
+  average log-likelihood per token (total / number_of_tokens).
+
+Ground truth rules:
+- If top-level "target" is an integer or numeric string, it is treated as the
+  index into the candidate list (0-based).
+- Otherwise we try to match the textual target (e.g., "yes") to one of the
+  candidate texts (case-insensitive, punctuation-insensitive). If no match is
+  found, we keep the raw target value.
+
+Robustness:
+- Handles both "filtered_resps" (list[str]) and "resps" (list[list[str]]).
+- Safely parses Python-literal-looking dict strings using ast.literal_eval.
+- Ignores malformed lines but logs them.
+
+Usage:
+  python parse_llm_jsonl_to_csv.py /path/to/ROOT
+  python parse_llm_jsonl_to_csv.py /path/to/ROOT --outdir /path/to/OUTPUT_ROOT
+  python parse_llm_jsonl_to_csv.py /path/to/ROOT --pattern "**/*.jsonl" --overwrite
+
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import csv
 import json
-import pandas as pd
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from tqdm import tqdm
-from ast import literal_eval
-from typing import Any, Dict, List, Optional
+# ----------------------------- helpers ---------------------------------
 
-
-LETTER_TO_IDX = {chr(ord('A') + i): i for i in range(26)}
-
-
-def extract_task_name(filename: str) -> str:
-    base = os.path.splitext(filename)[0]
-    rest = base[len("samples_"):] if base.startswith("samples_") else base
-    if "_" in rest:
-        rest = rest.rsplit("_", 1)[0]
-    return rest
+NON_ALNUM = re.compile(r"[^\w]+", flags=re.UNICODE)
 
 
-def normalize_text(s: str) -> str:
-    return " ".join(s.strip().split()).casefold()
+def norm_text(s: str) -> str:
+    """Normalize short answer text for loose matching."""
+    return NON_ALNUM.sub(" ", s).strip().lower()
 
 
-def _entropy_weighted_avg_logprobs(logprobs: List[float], entropies: List[float]):
-    """Compute sum(H_i * lp_i) / sum(H_i). If sum(H_i)==0, fall back to mean logprobs.
-    Returns pandas.NA if inputs are empty.
+def sorted_gen_args(arguments: Dict[str, Any]) -> List[str]:
+    """Return argument keys (gen_args_*) sorted by their numeric suffix."""
+    keys = [k for k in (arguments or {}).keys() if k.startswith("gen_args_")]
+    def key_idx(k: str) -> int:
+        try:
+            return int(k.split("_")[-1])
+        except Exception:
+            return 10**9
+    return sorted(keys, key=key_idx)
+
+
+def extract_options(record: Dict[str, Any]) -> List[str]:
+    """Extract candidate answer texts from arguments.gen_args_*.arg_1.
+
+    Falls back to empty list if not present.
     """
-    if not logprobs:
-        return pd.NA
-    if not entropies or len(entropies) != len(logprobs):
-        return sum(logprobs) / len(logprobs)
-    denom = sum(entropies)
-    if denom == 0:
-        return sum(logprobs) / len(logprobs)
-    num = sum(h * lp for h, lp in zip(entropies, logprobs))
-    return num / denom
+    arguments = record.get("arguments") or {}
+    opts: List[str] = []
+    for k in sorted_gen_args(arguments):
+        v = arguments.get(k) or {}
+        ans = v.get("arg_1")
+        if isinstance(ans, str):
+            opts.append(ans.strip())
+        else:
+            # Sometimes answers might be encoded differently; try to stringify
+            opts.append(str(ans))
+    return opts
 
 
-def get_candidate_resps(record: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Return candidate response dicts from filtered_resps or resps."""
-    if record.get("filtered_resps"):
-        entries = record["filtered_resps"]
-    elif record.get("resps"):
-        raw = record["resps"]
-        entries = [r[0] if isinstance(r, list) and r else r for r in raw]
-    else:
-        return []
+def parse_resp_obj(obj: Any) -> Optional[Dict[str, Any]]:
+    """Parse a single response entry into a dict with total_loglikelihood and logprobs.
 
-    out: List[Dict[str, Any]] = []
-    for e in entries:
-        if isinstance(e, dict):
-            out.append(e)
-        elif isinstance(e, str):
-            out.append(literal_eval(e))
-    return out
-
-
-def resolve_correct_index(record: Dict[str, Any], num_candidates: int) -> Optional[int]:
-    """Resolve the ground-truth index from several possible fields and formats."""
-    choices = record.get("doc", {}).get("choices")
-
-    def try_coerce(val: Any) -> Optional[int]:
-        if isinstance(val, int):
-            return val if 0 <= val < num_candidates else None
-        if isinstance(val, float) and float(val).is_integer():
-            ival = int(val)
-            return ival if 0 <= ival < num_candidates else None
-        if isinstance(val, str):
-            s = val.strip()
-            if s.isdigit():
-                ival = int(s)
-                return ival if 0 <= ival < num_candidates else None
-            lower = s.lower()
-            if lower.startswith("answer:"):
-                s = s.split(":", 1)[1].strip()
-            s = s.strip().rstrip(".")
-            if len(s) >= 2 and s[0] == "(" and s[-1] == ")":
-                s = s[1:-1].strip()
-            if len(s) == 1 and s.upper() in LETTER_TO_IDX:
-                idx = LETTER_TO_IDX[s.upper()]
-                return idx if 0 <= idx < num_candidates else None
-            for tok in s.replace("(", " ").replace(")", " ").split()[::-1]:
-                up = tok.upper()
-                if len(up) == 1 and up in LETTER_TO_IDX:
-                    idx = LETTER_TO_IDX[up]
-                    return idx if 0 <= idx < num_candidates else None
-            if choices and isinstance(choices, list):
-                s_norm = normalize_text(s)
-                for i, ch in enumerate(choices):
-                    if normalize_text(str(ch)) == s_norm:
-                        return i if 0 <= i < num_candidates else None
+    The JSON often stores Python-literal strings like: "{'total_loglikelihood': -0.5, ...}".
+    We use ast.literal_eval for safety.
+    """
+    if obj is None:
         return None
-
-    for cand in [record.get("target"), record.get("doc", {}).get("answer"), record.get("doc", {}).get("target")]:
-        idx = try_coerce(cand)
-        if idx is not None:
-            return idx
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, list):
+        obj = obj[0] if obj else None
+        if obj is None:
+            return None
+    if isinstance(obj, str):
+        s = obj.strip()
+        # If it's JSON-looking with single quotes, literal_eval works well.
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            # Try JSON loads as a fallback (if it uses double quotes)
+            try:
+                return json.loads(s)
+            except Exception:
+                return None
     return None
 
 
-def best_pred_index(resp_dicts: List[Dict[str, Any]]) -> Optional[int]:
-    if not resp_dicts:
-        return None
-    best_i = 0
-    best_val = float("-inf")
-    for i, d in enumerate(resp_dicts):
-        val = d.get("total_loglikelihood", float("-inf"))
-        if val > best_val:
-            best_val = val
-            best_i = i
-    return best_i
+def extract_candidate_scores(record: Dict[str, Any], num_options: int) -> List[Tuple[float, int]]:
+    """Return list of (total_loglikelihood, token_count) per candidate.
 
-
-def process_results(base_dir: str, drop_unresolved: bool = False):
-    """Return {model: {task: DataFrame}} where each DF has two rows per doc: role in {gt, pred}.
-    Columns: doc_id, role, avg_logprobs, avg_token_entropy, entropy_weighted_avg_logprobs,
-             total_loglikelihood, num_tokens, correct.
+    Prefers filtered_resps; falls back to resps.
     """
-    model_data: Dict[str, Dict[str, pd.DataFrame]] = {}
-    progress_bar = tqdm(total=len(os.listdir(base_dir)))
+    scores: List[Tuple[float, int]] = []
 
-    for model_name in os.listdir(base_dir):
-        model_path = os.path.join(base_dir, model_name)
-        if not os.path.isdir(model_path):
+    src = record.get("filtered_resps")
+    if not src:
+        src = record.get("resps")
+
+    if not isinstance(src, Sequence):
+        src = []
+
+    # Ensure length matches options length when possible
+    for i in range(num_options):
+        entry = None
+        if i < len(src):
+            entry = src[i]
+        resp = parse_resp_obj(entry)
+        if resp is None:
+            scores.append((float("-inf"), 0))
             continue
+        total = resp.get("total_loglikelihood")
+        if total is None:
+            # Some variants might use another key; treat as missing
+            total = float("-inf")
+        try:
+            total_f = float(total)
+        except Exception:
+            total_f = float("-inf")
+        logprobs = resp.get("logprobs")
+        tok_count = len(logprobs) if isinstance(logprobs, Sequence) else 1
+        scores.append((total_f, tok_count))
+    return scores
 
-        for file in os.listdir(model_path):
-            if not (file.endswith(".jsonl") and file.startswith("samples_")):
+
+def choose_indices(scores: List[Tuple[float, int]]) -> Tuple[int, int]:
+    """Return indices for (max total, max average per token)."""
+    if not scores:
+        return -1, -1
+    best_total = max(range(len(scores)), key=lambda i: scores[i][0])
+    best_avg = max(range(len(scores)), key=lambda i: (scores[i][0] / max(1, scores[i][1])))
+    return best_total, best_avg
+
+
+def ground_truth_text(record: Dict[str, Any], options: List[str]) -> str:
+    """Derive the ground-truth answer text.
+
+    Priority:
+      1) If target is an int (or numeric string), map to options[index] when possible.
+      2) Else, try to match textual target to an option ignoring case/punct.
+      3) Else, return the raw target as a string.
+    """
+    target = record.get("target")
+
+    # 1) index-like targets (e.g., "3", 0)
+    idx: Optional[int] = None
+    if isinstance(target, (int, float)):
+        idx = int(target)
+    elif isinstance(target, str):
+        t = target.strip()
+        if t.isdigit():
+            idx = int(t)
+    if idx is not None and 0 <= idx < len(options):
+        return options[idx]
+
+    # 2) textual target matching (yes/no or labels like A/B/C/D)
+    if isinstance(target, str):
+        t_norm = norm_text(target)
+        # Exact option text match
+        for opt in options:
+            if norm_text(opt) == t_norm:
+                return opt
+        # Single-letter label mapping (A-D etc.)
+        if len(t_norm) == 1 and t_norm.isalpha():
+            letter = t_norm.upper()
+            pos = ord(letter) - ord('A')
+            if 0 <= pos < len(options):
+                return options[pos]
+        return target
+
+    # Fallback: stringify whatever it is
+    return str(target)
+
+
+def derive_model_and_task(root: Path, file_path: Path) -> Tuple[str, str]:
+    """Model is the first directory under ROOT; task is the filename stem."""
+    rel = file_path.relative_to(root)
+    parts = rel.parts
+    model = parts[0] if parts else "unknown_model"
+    task = file_path.stem
+    return model, task
+
+
+# ----------------------------- core ------------------------------------
+
+def process_jsonl_file(root: Path, file_path: Path, outdir: Optional[Path], overwrite: bool = False) -> Optional[Path]:
+    model, task = derive_model_and_task(root, file_path)
+
+    # Output path
+    if outdir:
+        out_path = outdir / file_path.relative_to(root)
+        out_path = out_path.with_suffix(".csv")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = file_path.with_suffix(".csv")
+
+    if out_path.exists() and not overwrite:
+        print(f"[skip] {out_path} exists. Use --overwrite to replace.")
+        return out_path
+
+    rows: List[List[str]] = []
+
+    with file_path.open("r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
                 continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # Some logs may contain single quotes at the top level; try literal_eval
+                try:
+                    record = ast.literal_eval(line)
+                except Exception as e:
+                    print(f"[warn] {file_path}:{ln}: cannot parse JSON line ({e}).")
+                    continue
 
-            progress_bar.set_description(f"Processing {model_name}/{file}")
+            options = extract_options(record)
+            scores = extract_candidate_scores(record, len(options))
+            idx_total, idx_avg = choose_indices(scores)
 
-            task_name = extract_task_name(file)
-            file_path = os.path.join(model_path, file)
+            pred_total = options[idx_total] if 0 <= idx_total < len(options) else ""
+            pred_avg = options[idx_avg] if 0 <= idx_avg < len(options) else ""
+            gt = ground_truth_text(record, options)
 
-            rows: List[Dict[str, Any]] = []
-            with open(file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+            rows.append([
+                model,
+                task,
+                pred_total,
+                pred_avg,
+                gt,
+            ])
 
-                    doc_id = record.get("doc_id")
-                    resp_dicts = get_candidate_resps(record)
-                    if not resp_dicts:
-                        if not drop_unresolved:
-                            for role in ("gt", "pred"):
-                                rows.append({
-                                    "doc_id": doc_id,
-                                    "role": role,
-                                    "avg_logprobs": pd.NA,
-                                    "avg_token_entropy": pd.NA,
-                                    "entropy_weighted_avg_logprobs": pd.NA,
-                                    "total_loglikelihood": pd.NA,
-                                    "num_tokens": pd.NA,
-                                    "correct": pd.NA,
-                                })
-                        continue
+    # Write CSV
+    header = [
+        "model",
+        "task",
+        "predicted_answer_total_loglikelihood",
+        "predicted_answer_avg_token_likelihood",
+        "ground_truth_answer",
+    ]
 
-                    gt_idx = resolve_correct_index(record, len(resp_dicts))
-                    pred_idx = best_pred_index(resp_dicts)
+    with out_path.open("w", encoding="utf-8", newline="") as fo:
+        w = csv.writer(fo)
+        w.writerow(header)
+        w.writerows(rows)
 
-                    correct_flag = (
-                        None if gt_idx is None or pred_idx is None else int(pred_idx == gt_idx)
-                    )
+    print(f"[ok] Wrote {out_path} ({len(rows)} rows)")
+    return out_path
 
-                    def stats_for(idx: Optional[int]) -> Dict[str, Any]:
-                        if idx is None:
-                            return {
-                                "avg_logprobs": pd.NA,
-                                "avg_token_entropy": pd.NA,
-                                "entropy_weighted_avg_logprobs": pd.NA,
-                                "total_loglikelihood": pd.NA,
-                                "num_tokens": pd.NA,
-                            }
-                        resp = resp_dicts[idx]
-                        lp = resp.get("logprobs", []) or []
-                        ent = resp.get("entropies", []) or []
-                        total_ll = resp.get("total_loglikelihood", pd.NA)
-                        return {
-                            "avg_logprobs": (sum(lp) / len(lp)) if lp else pd.NA,
-                            "avg_token_entropy": (sum(ent) / len(ent)) if ent else pd.NA,
-                            "entropy_weighted_avg_logprobs": _entropy_weighted_avg_logprobs(lp, ent),
-                            "total_loglikelihood": total_ll,
-                            "num_tokens": len(lp),
-                        }
 
-                    # GT row
-                    rows.append({
-                        "doc_id": doc_id,
-                        "role": "gt",
-                        **stats_for(gt_idx),
-                        "correct": pd.NA if correct_flag is None else correct_flag,
-                    })
+# ----------------------------- cli -------------------------------------
 
-                    # Pred row
-                    rows.append({
-                        "doc_id": doc_id,
-                        "role": "pred",
-                        **stats_for(pred_idx),
-                        "correct": pd.NA if correct_flag is None else correct_flag,
-                    })
+def main():
+    ap = argparse.ArgumentParser(description="Parse LLM evaluation JSONL files into CSVs.")
+    ap.add_argument("root", type=Path, help="Root directory containing per-model subfolders with JSONL files.")
+    ap.add_argument("--outdir", type=Path, default=None, help="Optional output root directory to mirror structure into.")
+    ap.add_argument("--pattern", type=str, default="**/*.jsonl", help="Glob pattern (relative to each model folder) to find files. Default: **/*.jsonl")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing CSVs.")
 
-            df = pd.DataFrame(rows)
-            model_data.setdefault(model_name, {})[task_name] = df
+    args = ap.parse_args()
 
-        progress_bar.update(1)
+    root: Path = args.root.resolve()
+    outdir: Optional[Path] = args.outdir.resolve() if args.outdir else None
 
-    return model_data
+    if not root.exists() or not root.is_dir():
+        raise SystemExit(f"Root path not found or not a directory: {root}")
+
+    # Find all jsonl files under root
+    files = sorted(root.rglob("*.jsonl"))
+    if not files:
+        print(f"[info] No JSONL files found under {root}")
+        return
+
+    for fp in files:
+        try:
+            process_jsonl_file(root, fp, outdir=outdir, overwrite=args.overwrite)
+        except Exception as e:
+            print(f"[error] Failed to process {fp}: {e}")
 
 
 if __name__ == "__main__":
-    base_dir = "results_scratch"  # replace with your top-level directory path
-    results = process_results(base_dir)
-
-    for model, tasks in results.items():
-        for task, df in tasks.items():
-            out_dir = os.path.join("processed_results", model)
-            os.makedirs(out_dir, exist_ok=True)
-            df.to_csv(os.path.join(out_dir, f"{task}.csv"), index=False)
+    main()
