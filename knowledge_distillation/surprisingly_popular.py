@@ -44,7 +44,7 @@ Output: reply with EXACTLY one of the option strings above. Do NOT add any extra
 CROWD_PROMPT_TEMPLATE = """
 Now ignore correctness and estimate what percentage of average adults would choose EACH option as their answer to the same question.
 
-Return a single JSON object where the KEYS are the option strings (copied verbatim) and the VALUES are INTEGER percentages (0–100) that sum to 100.
+Return a single JSON object where the KEYS are the option strings (copied verbatim) and the VALUES are INTEGER percentages (0-100) that sum to 100.
 
 Question:
 {question}
@@ -234,7 +234,8 @@ def main():
         prompt_str = tokenizer.apply_chat_template(
             conversation=messages,
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            enable_thinking=False
         )
         round1_prompts.append(prompt_str)
         round1_meta.append({"qid": it["qid"], "question": it["question"], "options": it["options"]})
@@ -305,7 +306,8 @@ def main():
         prompt_str = tokenizer.apply_chat_template(
             conversation=messages,
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            enable_thinking=False
         )
         round2_prompts.append(prompt_str)
 
