@@ -277,7 +277,8 @@ def main():
         })
 
     df = pd.DataFrame(rows)
-    out_file = os.path.join(args.output_dir, "truthfulqa_mc1_two_rounds.csv")
+    true_model_name = args.model.split("/")[-1]
+    out_file = os.path.join(args.output_dir, true_model_name, "truthfulqa_mc1_two_rounds.csv")
     df.to_csv(out_file, index=False, encoding="utf-8")
     print(f"Saved per-question results to: {out_file}")
 
