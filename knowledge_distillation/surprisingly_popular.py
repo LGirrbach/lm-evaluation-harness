@@ -157,7 +157,7 @@ def main():
         model=args.model,
         enable_chunked_prefill=True,
         max_num_batched_tokens=32768,
-        max_model_len=2048,
+        max_model_len=3000,
         gpu_memory_utilization=0.95,
         trust_remote_code=True
     )
@@ -282,7 +282,14 @@ def main():
 
     df = pd.DataFrame(rows)
     true_model_name = args.model.split("/")[-1]
-    out_file = os.path.join(args.output_dir, true_model_name, "mcq_two_rounds.csv")
+    
+    # Extract dataset name for the save path
+    if args.dataset.lower() == "mmlu" or args.format == "mmlu":
+        dataset_name = "mmlu"
+    else:
+        dataset_name = os.path.splitext(os.path.basename(args.dataset))[0]
+    
+    out_file = os.path.join(args.output_dir, true_model_name, f"{dataset_name}_mcq_two_rounds.csv")
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     df.to_csv(out_file, index=False, encoding="utf-8")
     print(f"Saved per-question results to: {out_file}")
