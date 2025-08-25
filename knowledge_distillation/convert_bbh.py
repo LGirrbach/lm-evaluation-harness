@@ -45,6 +45,7 @@ def load_bbh_dataset():
                 
                 # Add category information to each item
                 for item in train_data:
+                    item = dict(item)
                     item["category"] = category
                 
                 all_items.extend(train_data)
