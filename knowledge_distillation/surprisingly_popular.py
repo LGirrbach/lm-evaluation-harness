@@ -9,6 +9,8 @@ import pandas as pd
 from tqdm import tqdm
 from vllm import LLM, SamplingParams
 
+from dataset_loader import load_dataset, MCQItem
+
 
 # =========================
 # Shared prompts
@@ -56,15 +58,7 @@ Output: reply with EXACTLY one of the option strings above. Do NOT add any extra
 # Utilities
 # =========================
 
-def normalize_options_mc1(mc1_targets: Dict[str, int]) -> List[str]:
-    # Keep JSON (insertion) order
-    return list(mc1_targets.keys())
 
-def get_correct_option_mc1(mc1_targets: Dict[str, int]) -> str:
-    for k, v in mc1_targets.items():
-        if int(v) == 1:
-            return k
-    raise ValueError("No correct option (value==1) found in mc1_targets.")
 
 def build_options_block(options: List[str]) -> str:
     return "\n".join([f"- {opt}" for opt in options])
@@ -110,9 +104,11 @@ def compute_accuracy(preds: List[str], golds: List[str]) -> float:
 # =========================
 
 def main():
-    parser = argparse.ArgumentParser(description="TruthfulQA (mc1) two-round sampling with vLLM")
-    parser.add_argument("--truthfulqa_json", type=str, required=True,
-                        help="Path to TruthfulQA multiple-choice JSON file (817 items).")
+    parser = argparse.ArgumentParser(description="Multiple-choice questions two-round sampling with vLLM")
+    parser.add_argument("--dataset", type=str, required=True,
+                        help="Path to multiple-choice questions JSON file (or 'mmlu' for MMLU dataset from Hugging Face).")
+    parser.add_argument("--format", type=str, choices=["auto", "truthfulqa", "standard", "mmlu"], default="auto",
+                        help="Dataset format: 'auto' for auto-detection, 'truthfulqa' for original TruthfulQA format, 'standard' for new standardized format, 'mmlu' for MMLU from Hugging Face.")
     parser.add_argument("--model", type=str, default="microsoft/phi-4",
                         help="HF model name.")
     parser.add_argument("--num-samples", type=int, default=20,
@@ -121,31 +117,39 @@ def main():
                         help="Sampling temperature.")
     parser.add_argument("--max-tokens", type=int, default=32,
                         help="Max new tokens for each generation.")
-    parser.add_argument("--output_dir", type=str, default="results/truthfulqa_two_rounds/",
+    parser.add_argument("--output_dir", type=str, default="results/mcq_two_rounds/",
                         help="Directory to save CSV outputs.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load TruthfulQA JSON
-    with open(args.truthfulqa_json, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    assert isinstance(data, list), "Input JSON must be a list of items."
-    print(f"Loaded {len(data)} items from TruthfulQA.")
-
-    # Prepare items
-    items = []
-    for qid, item in enumerate(data):
-        q_text = item["question"]
-        mc1_targets = item["mc1_targets"]
-        options = normalize_options_mc1(mc1_targets)
-        correct = get_correct_option_mc1(mc1_targets)
-        items.append({
-            "qid": qid,
-            "question": q_text,
-            "options": options,
-            "correct": correct
-        })
+    # Load dataset using unified loader
+    format_type = None if args.format == "auto" else args.format
+    
+    # Special handling for MMLU dataset
+    if args.dataset.lower() == "mmlu" or format_type == "mmlu":
+        print("Loading MMLU dataset from Hugging Face...")
+        try:
+            from dataset_loader import load_mmlu_dataset
+            items = load_mmlu_dataset()
+            print(f"Loaded {len(items)} questions successfully.")
+        except Exception as e:
+            print(f"Error loading MMLU dataset: {e}")
+            return 1
+    else:
+        # Load from file
+        print(f"Loading dataset from: {args.dataset}")
+        if format_type:
+            print(f"Using format: {format_type}")
+        else:
+            print("Auto-detecting format...")
+        
+        try:
+            items = load_dataset(args.dataset, format_type)
+            print(f"Loaded {len(items)} questions successfully.")
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            return 1
 
     # Initialize vLLM
     print(f"Loading model: {args.model} ...")
@@ -165,9 +169,9 @@ def main():
     print("Preparing Round 1 prompts (direct answers)...")
     round1_prompts = []
     for it in items:
-        options_block = build_options_block(it["options"])
+        options_block = build_options_block(it.options)
         user_prompt = DIRECT_PROMPT_TEMPLATE.format(
-            question=it["question"],
+            question=it.question,
             options_block=options_block
         )
         messages = [
@@ -194,7 +198,7 @@ def main():
     r1_samples_per_q: List[List[str]] = []
     r1_mode_answers: List[str] = []
     for it, out in zip(items, outputs1):
-        options = it["options"]
+        options = it.options
         samples = []
         for cand in out.outputs:
             ans = clean_choice(cand.text)
@@ -213,13 +217,13 @@ def main():
     print("Preparing Round 2 prompts (predicted popular answer)...")
     round2_prompts = []
     for it, direct_mode in zip(items, r1_mode_answers):
-        options_block = build_options_block(it["options"])
+        options_block = build_options_block(it.options)
         round1_user = DIRECT_PROMPT_TEMPLATE.format(
-            question=it["question"],
+            question=it.question,
             options_block=options_block
         )
         round2_user = CROWD_PROMPT_TEMPLATE.format(
-            question=it["question"],
+            question=it.question,
             options_block=options_block
         )
         messages = [
@@ -248,7 +252,7 @@ def main():
     r2_samples_per_q: List[List[str]] = []
     r2_mode_answers: List[str] = []
     for it, out in zip(items, outputs2):
-        options = it["options"]
+        options = it.options
         samples = []
         for cand in out.outputs:
             ans = clean_choice(cand.text)
@@ -267,9 +271,9 @@ def main():
         items, r1_mode_answers, r2_mode_answers, r1_samples_per_q, r2_samples_per_q
     ):
         rows.append({
-            "qid": it["qid"],
-            "question": it["question"],
-            "correct": it["correct"],
+            "qid": it.qid,
+            "question": it.question,
+            "correct": it.correct,
             "direct_answer_mode": d_mode,
             "crowd_answer_mode": c_mode,
             "direct_samples_json": json.dumps(d_samp, ensure_ascii=False),
@@ -278,14 +282,15 @@ def main():
 
     df = pd.DataFrame(rows)
     true_model_name = args.model.split("/")[-1]
-    out_file = os.path.join(args.output_dir, true_model_name, "truthfulqa_mc1_two_rounds.csv")
+    out_file = os.path.join(args.output_dir, true_model_name, "mcq_two_rounds.csv")
+    os.makedirs(os.path.dirname(out_file), exist_ok=True)
     df.to_csv(out_file, index=False, encoding="utf-8")
     print(f"Saved per-question results to: {out_file}")
 
     # ================
     # Descriptive stats (over samples) — no cross-model evaluation
     # ================
-    gold = [it["correct"] for it in items]
+    gold = [it.correct for it in items]
 
     # Direct accuracy of the per-question MODE
     direct_mode_acc = compute_accuracy(r1_mode_answers, gold)
@@ -294,7 +299,7 @@ def main():
     # i.e., for each question, accuracy is (correct count / n)
     per_q_sample_acc = []
     for it, samples in zip(items, r1_samples_per_q):
-        per_q_sample_acc.append(np.mean([s == it["correct"] for s in samples]))
+        per_q_sample_acc.append(np.mean([s == it.correct for s in samples]))
     avg_sample_acc = float(np.mean(per_q_sample_acc))
 
     # Agreement/consistency within each round
