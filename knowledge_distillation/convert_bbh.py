@@ -48,7 +48,7 @@ def load_bbh_dataset():
                     item = dict(item)
                     item["category"] = category
                 
-                all_items.extend(train_data)
+                    all_items.append(item)
             else:
                 print(f"  - {category}: No train split found")
                 
