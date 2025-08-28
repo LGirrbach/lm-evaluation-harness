@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Evaluate TruthfulQA MC1 results aggregated across models.
+Evaluate MCQ two-rounds results aggregated across models.
 
 Input layout (as produced by your generation script):
 <inputs_dir>/
   <modelA>/
-    truthfulqa_mc1_two_rounds.csv
+    {dataset_name}_mcq_two_rounds.csv
   <modelB>/
-    truthfulqa_mc1_two_rounds.csv
+    {dataset_name}_mcq_two_rounds.csv
   ...
 
 Each CSV has columns:
@@ -26,10 +26,10 @@ This script:
 4) Prints summary metrics.
 
 Usage:
-python evaluate_truthfulqa_across_models.py \
-  --inputs_dir results/truthfulqa_two_rounds \
-  --file_name truthfulqa_mc1_two_rounds.csv \
-  --out_dir results/truthfulqa_eval
+python evaluate_mcq_across_models.py \
+  --inputs_dir results/mcq_two_rounds \
+  --file_name auto \
+  --out_dir results/mcq_eval
 
 """
 
@@ -49,7 +49,24 @@ def list_model_dirs(inputs_dir: str) -> List[str]:
     )
 
 
+def detect_csv_file(model_dir: str) -> str:
+    """Detect the CSV file in a model directory."""
+    csv_files = [f for f in os.listdir(model_dir) if f.endswith('.csv')]
+    if not csv_files:
+        return ""
+    # Return the first CSV file found
+    return csv_files[0]
+
+
 def read_model_csv(model_dir: str, file_name: str) -> pd.DataFrame:
+    if file_name == "auto":
+        # Auto-detect the CSV file
+        detected_file = detect_csv_file(model_dir)
+        if not detected_file:
+            print(f"[WARN] No CSV file found in model dir: {model_dir}")
+            return pd.DataFrame()
+        file_name = detected_file
+    
     path = os.path.join(model_dir, file_name)
     if not os.path.exists(path):
         print(f"[WARN] Missing file for model dir: {model_dir}")
@@ -109,9 +126,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inputs_dir", type=str, required=True,
                     help="Directory containing model subfolders with per-model CSVs.")
-    ap.add_argument("--file_name", type=str, default="truthfulqa_mc1_two_rounds.csv",
-                    help="CSV file name inside each model folder.")
-    ap.add_argument("--out_dir", type=str, default="results/truthfulqa_eval",
+    ap.add_argument("--file_name", type=str, default="auto",
+                    help="CSV file name inside each model folder. Use 'auto' to auto-detect.")
+    ap.add_argument("--out_dir", type=str, default="results/mcq_eval",
                     help="Where to write aggregated outputs.")
     ap.add_argument("--min_models_per_q", type=int, default=1,
                     help="Drop questions with fewer than this many models contributing.")
@@ -221,7 +238,7 @@ def main():
     agg_df = pd.DataFrame(rows).sort_values("qid").reset_index(drop=True)
 
     # Save per-question aggregation
-    out_csv = os.path.join(args.out_dir, "truthfulqa_mc1_across_models_eval.csv")
+    out_csv = os.path.join(args.out_dir, "mcq_across_models_eval.csv")
     agg_df.to_csv(out_csv, index=False, encoding="utf-8")
     print(f"Saved per-question aggregation to: {out_csv}")
 
