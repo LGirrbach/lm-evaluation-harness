@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=surprisingly-popular      # Name of the job
+#SBATCH --job-name=p_true      # Name of the job
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=50GB
 #SBATCH --time=10:00:00
-#SBATCH --output=slurm_logs/surprisingly_popular/output/job_%a.out
-#SBATCH --error=slurm_logs/surprisingly_popular/error/job_%a.err
+#SBATCH --output=slurm_logs/p_true/output/job_%a.out
+#SBATCH --error=slurm_logs/p_true/error/job_%a.err
 #SBATCH --partition=gpu_p
 #SBATCH --qos=gpu_normal
 #SBATCH --gres=gpu:1
@@ -39,34 +39,13 @@ MODELS=(
 source /lustre/groups/eml/workspace/lgirrbach/miniforge3/etc/profile.d/conda.sh
 conda activate vllm
 
-# List of datasets to process
-DATASETS=(
-  "bbh"
-  "mmlu"
-  "medmcqa"
-  "commonsenseqa"
-  "openbookqa"
-)
-
-# List of crowd modes
-CROWD_MODES=("single_wrong" "full_dist")
-
-# List of r2-history options
-R2_HISTORY_OPTIONS=("none" "with_r1_answer")
+DATASETS=("bbh" "mmlu" "medmcqa" "commonsenseqa" "openbookqa")
 
 for dataset in "${DATASETS[@]}"; do
-  for crowd_mode in "${CROWD_MODES[@]}"; do
-    for r2_history in "${R2_HISTORY_OPTIONS[@]}"; do
-      python knowledge_distillation/surprisingly_popular.py \
-          --model ${MODELS[$SLURM_ARRAY_TASK_ID]} \
-          --dataset "knowledge_distillation/data/${dataset}_standard.json" \
-          --num-samples 5 \
-          --crowd-mode "${crowd_mode}" \
-          --r2-history "${r2_history}" \
-          --output_dir "results/surprisingly_popular_v3/${dataset}/${crowd_mode}/${r2_history}/"
-    done
-  done
+    python knowledge_distillation/p_true.py \
+        --model ${MODELS[$SLURM_ARRAY_TASK_ID]} \
+        --dataset "knowledge_distillation/data/${dataset}_standard.json" \
+        --output_dir "results/p_true/${dataset}/"
 done
-
 
   
