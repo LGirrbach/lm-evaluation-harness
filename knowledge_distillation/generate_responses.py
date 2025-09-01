@@ -43,7 +43,7 @@ def has_chat_template(tok) -> bool:
     return hasattr(tok, "apply_chat_template")
 
 
-def render_chat(tok, system_prompt: Optional[str], user_text: str) -> str:
+def render_chat(tok, system_prompt: Optional[str], user_text: str, max_model_len: int) -> str:
     """
     Render a single-turn chat prompt, explicitly disabling any 'thinking' features
     some chat templates expose.
@@ -52,7 +52,7 @@ def render_chat(tok, system_prompt: Optional[str], user_text: str) -> str:
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_text})
-    return tok.apply_chat_template(
+    chat = tok.apply_chat_template(
         messages,
         add_generation_prompt=True,
         tokenize=False,
@@ -60,6 +60,12 @@ def render_chat(tok, system_prompt: Optional[str], user_text: str) -> str:
         enable_thinking=False,
         thinking=False,
     )
+
+    # Check tokenized length of chat
+    chat_length_in_tokens = len(tok(chat, add_special_tokens=False).input_ids)
+    if chat_length_in_tokens > max_model_len:
+        raise ValueError(f"Chat length in tokens is greater than the model limit: {chat_length_in_tokens} > {max_model_len}")
+    return chat
 
 
 def render_fallback_plain(system_prompt: Optional[str], user_text: str) -> str:
@@ -146,6 +152,12 @@ def main():
         ds = ds.select(range(min(args.max_examples, len(ds))))
 
     # Initialize vLLM (optimized for offline/batch throughput)
+    max_model_len = 16384
+    if args.model == "01-ai/Yi-1.5-9B-Chat":
+        max_model_len = 4096
+    elif args.model == "google/gemma-2-9b-it":
+        max_model_len = 8192
+
     llm = LLM(
         model=args.model,
         trust_remote_code=True,          # needed by many HF chat models
@@ -154,7 +166,7 @@ def main():
         enable_chunked_prefill=True,     # throughput for long prompts
         enable_prefix_caching=True,      # helpful when many prompts share prefixes/system
         max_num_batched_tokens=32768,    # allow large batch token budgeting
-        max_model_len=2 * 8192,          # safe default; vLLM will cap to model limit
+        max_model_len=max_model_len,          # safe default; vLLM will cap to model limit
         gpu_memory_utilization=0.90,     # high utilization for offline inference
     )
     tok = llm.get_tokenizer()
@@ -164,12 +176,19 @@ def main():
     prompts: List[str] = []
     metas: List[Dict[str, Any]] = []
 
+    system_prompt = NEUTRAL_SYSTEM_PROMPT
+    if args.model == "google/gemma-2-9b-it":
+        system_prompt = None
+
     for row in tqdm(ds, desc="Preparing prompts"):
         prompt_text, sample_id = extract_prompt_and_id(row)
         if use_chat:
-            rendered = render_chat(tok, NEUTRAL_SYSTEM_PROMPT, prompt_text or "")
+            try:
+                rendered = render_chat(tok, system_prompt, prompt_text or "", max_model_len - args.max_tokens)
+            except ValueError as e:
+                continue
         else:
-            rendered = render_fallback_plain(NEUTRAL_SYSTEM_PROMPT, prompt_text or "")
+            rendered = render_fallback_plain(system_prompt, prompt_text or "", max_model_len - args.max_tokens)
 
         prompts.append(rendered)
         metas.append({
