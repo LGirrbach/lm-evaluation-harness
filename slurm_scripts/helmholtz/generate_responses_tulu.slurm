@@ -3,8 +3,8 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=50GB
 #SBATCH --time=23:00:00
-#SBATCH --output=slurm_logs/generate_responses/output/job_%a.out
-#SBATCH --error=slurm_logs/generate_responses/error/job_%a.err
+#SBATCH --output=slurm_logs/generate_responses/tulu/output/job_%a.out
+#SBATCH --error=slurm_logs/generate_responses/tulu/error/job_%a.err
 #SBATCH --partition=gpu_p
 #SBATCH --qos=gpu_normal
 #SBATCH --gres=gpu:1
