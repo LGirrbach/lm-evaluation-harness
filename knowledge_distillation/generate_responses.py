@@ -43,14 +43,17 @@ def has_chat_template(tok) -> bool:
     return hasattr(tok, "apply_chat_template")
 
 
-def render_chat(tok, system_prompt: Optional[str], user_text: str, max_model_len: int) -> str:
+def render_chat(tok, system_prompt: Optional[str], user_text: str, max_model_len: int, model_name: str) -> str:
     """
     Render a single-turn chat prompt, explicitly disabling any 'thinking' features
     some chat templates expose.
     """
     messages = []
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+        if model_name == "google/gemma-2-9b-it":
+            pass
+        else:
+            messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_text})
     chat = tok.apply_chat_template(
         messages,
@@ -86,7 +89,7 @@ def extract_prompt_and_id(row: Dict[str, Any]) -> (str, Optional[str]):
     """
     # Preferred id-like columns
     sample_id = None
-    for k in ("id", "sample_id", "example_id"):
+    for k in ("id", "sample_id", "example_id", "prompt_id"):
         if k in row and row[k] is not None:
             sample_id = str(row[k])
             break
@@ -126,6 +129,7 @@ def main():
 
     # Model / Inference
     ap.add_argument("--model", required=True, help="HF model id or local path (causal LM).")
+    ap.add_argument("--max-model-len", type=int, default=16384, help="Max prompt length in tokens.")
     ap.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM tensor parallelism.")
     ap.add_argument("--max-tokens", type=int, default=512, help="Max new tokens to generate per prompt.")
     ap.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default 0 for deterministic).")
@@ -135,11 +139,13 @@ def main():
 
     # Load dataset
     ds = load_dataset(args.dataset, split=args.split)
+    # Filter out prompts with more than 7000 tokens
+    ds = ds.filter(lambda x: len(x["prompt"].split()) < 7000)
 
     # Optionally filter to a single id
     if args.only_id is not None:
         # we try to match across common id columns
-        id_cols = ["id", "sample_id", "example_id"]
+        id_cols = ["id", "sample_id", "example_id", "prompt_id"]
         def matches(row):
             for c in id_cols:
                 if c in row and row[c] is not None and str(row[c]) == str(args.only_id):
@@ -152,11 +158,7 @@ def main():
         ds = ds.select(range(min(args.max_examples, len(ds))))
 
     # Initialize vLLM (optimized for offline/batch throughput)
-    max_model_len = 16384
-    if args.model == "01-ai/Yi-1.5-9B-Chat":
-        max_model_len = 4096
-    elif args.model == "google/gemma-2-9b-it":
-        max_model_len = 8192
+    max_model_len = args.max_model_len
 
     llm = LLM(
         model=args.model,
@@ -167,7 +169,7 @@ def main():
         enable_prefix_caching=True,      # helpful when many prompts share prefixes/system
         max_num_batched_tokens=32768,    # allow large batch token budgeting
         max_model_len=max_model_len,          # safe default; vLLM will cap to model limit
-        gpu_memory_utilization=0.90,     # high utilization for offline inference
+        gpu_memory_utilization=0.85,     # high utilization for offline inference
     )
     tok = llm.get_tokenizer()
     use_chat = has_chat_template(tok)
@@ -184,11 +186,11 @@ def main():
         prompt_text, sample_id = extract_prompt_and_id(row)
         if use_chat:
             try:
-                rendered = render_chat(tok, system_prompt, prompt_text or "", max_model_len - args.max_tokens)
+                rendered = render_chat(tok, system_prompt, prompt_text or "", max_model_len - args.max_tokens, args.model)
             except ValueError as e:
                 continue
         else:
-            rendered = render_fallback_plain(system_prompt, prompt_text or "", max_model_len - args.max_tokens)
+            rendered = render_fallback_plain(system_prompt, prompt_text or "", max_model_len - args.max_tokens, args.model)
 
         prompts.append(rendered)
         metas.append({
@@ -201,8 +203,6 @@ def main():
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
-        # Deterministic stopping unless the model uses eos automatically
-        # You can add stop tokens if your dataset embeds explicit sentinels.
     )
 
     # Generate (batched internally by vLLM)
